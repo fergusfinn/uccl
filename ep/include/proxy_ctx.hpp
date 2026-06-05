@@ -2,6 +2,13 @@
 #include "barrier_local.hpp"
 #include "util/gpu_rt.h"
 #include <infiniband/verbs.h>
+#ifdef USE_CXI
+#include <rdma/fabric.h>
+#include <rdma/fi_domain.h>
+#include <rdma/fi_endpoint.h>
+#include <rdma/fi_cm.h>
+#include <rdma/fi_rma.h>
+#endif
 #include <atomic>
 #include <map>
 #include <unordered_map>
@@ -62,6 +69,19 @@ struct WRSegment {
 
 struct ProxyCtx {
   // RDMA objects
+#ifdef USE_CXI
+  struct fi_info* fi_info = nullptr;
+  struct fid_fabric* fabric = nullptr;
+  struct fid_domain* domain = nullptr;
+  struct fid_ep* ep = nullptr;
+  struct fid_cq* cq = nullptr;
+  struct fid_av* av = nullptr;
+  struct fid_mr* fi_mr = nullptr;
+  struct fid_mr* fi_atomic_mr = nullptr;
+  std::vector<fi_addr_t> peer_fi_addrs;
+  void* local_addr = nullptr;
+  size_t local_len = 0;
+#else
   ibv_context* context = nullptr;
   ibv_pd* pd = nullptr;
   ibv_mr* mr = nullptr;
@@ -74,6 +94,7 @@ struct ProxyCtx {
   // std::vector<ibv_cq*> extra_cqs;
   ibv_qp* ack_qp = nullptr;
   ibv_qp* recv_ack_qp = nullptr;
+#endif
   // EFA shared-QP model: when true, the QP and ack_recv_buf/mr fields above
   // alias another ProxyCtx (typically Proxy::ctx_) and must not be destroyed.
   bool qps_are_shared = false;
@@ -230,8 +251,14 @@ struct ProxyCtx {
   }
 };
 
+#ifdef USE_CXI
+inline fid_cq* get_cq(ProxyCtx& S) {
+  return S.cq;
+}
+#else
 // Return the CQ as ibv_cq* for polling/destroy. When EFA we store cq_ex and
 // destroy with ibv_destroy_cq(ibv_cq_ex_to_cq(cq_ex)).
 inline ibv_cq* get_cq(ProxyCtx& S) {
   return S.cq_ex ? ibv_cq_ex_to_cq(S.cq_ex) : S.cq;
 }
+#endif

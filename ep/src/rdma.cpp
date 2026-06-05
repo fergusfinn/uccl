@@ -1,4 +1,12 @@
 #include "rdma.hpp"
+#ifdef USE_CXI
+#include <rdma/fabric.h>
+#include <rdma/fi_domain.h>
+#include <rdma/fi_endpoint.h>
+#include <rdma/fi_cm.h>
+#include <rdma/fi_rma.h>
+#include <rdma/fi_errno.h>
+#endif
 #include "adaptive_sleeper.hpp"
 #include "common.hpp"
 #include "proxy_ctx.hpp"
@@ -389,6 +397,7 @@ bool is_cuda_host_pointer(void* ptr) {
 
 }  // namespace
 
+#ifndef USE_CXI
 void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
                           int thread_idx, int local_rank) {
   if (S.context) return;  // already initialized
@@ -685,7 +694,9 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
   g_shared_rdma_cv.notify_all();
 #endif
 }
+#endif // !USE_CXI
 
+#ifndef USE_CXI
 namespace {
 
 template <typename ProbeFn>
@@ -976,7 +987,9 @@ struct ibv_qp* create_srd_qp_ex(ProxyCtx& S) {
   return qp;
 }
 #endif
+#endif // !USE_CXI
 
+#ifndef USE_CXI
 void create_per_thread_qp(ProxyCtx& S, void* gpu_buffer, size_t size,
                           RDMAConnectionInfo* local_info, int rank,
                           size_t num_rings, bool use_normal_mode,
@@ -1098,7 +1111,9 @@ void create_per_thread_qp(ProxyCtx& S, void* gpu_buffer, size_t size,
 
   fill_local_gid(S, local_info);
 }
+#endif // !USE_CXI
 
+#ifndef USE_CXI
 void modify_qp_to_init(ProxyCtx& S) {
 #ifdef EFA
   return;
@@ -1147,7 +1162,9 @@ void modify_qp_to_init(ProxyCtx& S) {
 
   printf("QP modified to INIT state\n");
 }
+#endif // !USE_CXI
 
+#ifndef USE_CXI
 struct ibv_ah* create_ah(ProxyCtx& S, uint8_t* remote_gid) {
   struct ibv_ah_attr ah_attr = {};
   ah_attr.is_global = 1;  // Enable Global Routing Header (GRH)
@@ -1165,7 +1182,9 @@ struct ibv_ah* create_ah(ProxyCtx& S, uint8_t* remote_gid) {
   }
   return ah;
 }
+#endif // !USE_CXI
 
+#ifndef USE_CXI
 void modify_qp_to_rtr(ProxyCtx& S, RDMAConnectionInfo* remote,
                       bool use_normal_mode) {
 #ifdef EFA
@@ -1301,7 +1320,9 @@ void modify_qp_to_rtr(ProxyCtx& S, RDMAConnectionInfo* remote,
 
   printf("ACK-QP modified to RTR state\n");
 }
+#endif // !USE_CXI
 
+#ifndef USE_CXI
 void modify_qp_to_rts(ProxyCtx& S, RDMAConnectionInfo* local_info) {
 #ifdef EFA
   return;
@@ -1351,7 +1372,9 @@ void modify_qp_to_rts(ProxyCtx& S, RDMAConnectionInfo* local_info) {
 
   printf("ACK-QP modified to RTS state\n");
 }
+#endif // !USE_CXI
 
+#ifndef USE_CXI
 void post_receive_buffer_for_imm_on_qp(ProxyCtx& S, ibv_qp* qp) {
   std::vector<ibv_recv_wr> wrs(kMaxOutstandingRecvs);
   std::vector<ibv_sge> sges(kMaxOutstandingRecvs);
@@ -1382,8 +1405,10 @@ void post_receive_buffer_for_imm(ProxyCtx& S) {
     post_receive_buffer_for_imm_on_qp(S, q);  // per-ring QPs
   }
 }
+#endif // !USE_CXI
 
 // Normal mode implementation
+#ifndef USE_CXI
 static void post_rdma_async_batched_normal_mode(
     ProxyCtx& S, void* buf, size_t num_wrs,
     std::vector<uint64_t> const& wrs_to_post,
@@ -1818,8 +1843,10 @@ static void post_rdma_async_batched_normal_mode(
     }
   }
 }
+#endif // !USE_CXI
 
 // Fast mode implementation
+#ifndef USE_CXI
 static void post_rdma_async_batched_fast_mode(
     ProxyCtx& S, void* buf, size_t num_wrs,
     std::vector<uint64_t> const& wrs_to_post,
@@ -2087,6 +2114,7 @@ void post_rdma_async_batched(ProxyCtx& S, void* buf, size_t num_wrs,
                                       cmds_to_post, ctxs, my_rank, thread_idx);
   }
 }
+#endif // !USE_CXI
 
 void local_process_completions(ProxyCtx& S,
                                std::unordered_set<uint64_t>& acked_wrs,
@@ -2176,6 +2204,7 @@ int poll_cq_once(ibv_cq* cq, ibv_wc* wc, int max_cqes) {
 #endif
 }
 
+#ifndef USE_CXI
 void local_poll_completions(ProxyCtx& S,
                             std::unordered_set<uint64_t>& acked_wrs,
                             int thread_idx,
@@ -2213,6 +2242,7 @@ void poll_cq_dual(ProxyCtx& S, std::unordered_set<uint64_t>& acked_wrs,
   if (get_cq(S)) poll_one(get_cq(S));
   // for (auto* cq : S.extra_cqs) poll_one(cq);
 }
+#endif // !USE_CXI
 
 void apply_pending_updates(ProxyCtx& ctx,
                            std::set<PendingUpdate>& pending_atomic_updates,
@@ -2250,6 +2280,7 @@ void apply_pending_updates(ProxyCtx& ctx,
   }
 }
 
+#ifndef USE_CXI
 ibv_qp* qp_from_qpnum(ProxyCtx& S, uint32_t qpnum) {
   if (S.qp && S.qp->qp_num == qpnum) return S.qp;
   if (S.recv_ack_qp && S.recv_ack_qp->qp_num == qpnum) return S.recv_ack_qp;
@@ -2258,6 +2289,7 @@ ibv_qp* qp_from_qpnum(ProxyCtx& S, uint32_t qpnum) {
     if (q && q->qp_num == qpnum) return q;
   return nullptr;
 }
+#endif // !USE_CXI
 
 void remote_process_completions_normal_mode(
     ProxyCtx& S, int idx, CopyRingBuffer& g_ring, int ne, ibv_wc* wc,
@@ -2395,6 +2427,23 @@ void remote_process_completions_normal_mode(
       std::abort();
     }
 
+#ifdef USE_CXI
+    if (cqe.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+      uint32_t const tag = wr_tag(cqe.wr_id);
+      if (tag >= ctx_by_tag.size() || ctx_by_tag[tag] == nullptr) {
+        fprintf(stderr, "Invalid tag or uninitialized context for tag=%u\n", tag);
+        std::abort();
+      }
+      ProxyCtx& S_rep = *ctx_by_tag[tag];
+      S_rep.pool_index = (S_rep.pool_index + 1) % (kRemoteBufferSize / kObjectSize - 1);
+      uint64_t r_wr_id = make_wr_id(tag, S_rep.pool_index);
+      int ret = fi_recv(S_rep.ep, S_rep.local_addr, 0, fi_mr_desc(S_rep.fi_mr), FI_ADDR_UNSPEC, (void*)r_wr_id);
+      if (ret != 0) {
+        fprintf(stderr, "fi_recv (replenish) failed: %d (%s)\n", ret, fi_strerror(-ret));
+        std::abort();
+      }
+    }
+#else
 #ifndef EFA
     if (cqe.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
       uint32_t const tag = wr_tag(cqe.wr_id);
@@ -2431,6 +2480,7 @@ void remote_process_completions_normal_mode(
         std::abort();
       }
     }
+#endif
 #endif
   }
 }
@@ -2541,6 +2591,18 @@ void remote_process_completions_fast_mode(
           reinterpret_cast<std::atomic<int64_t>*>(atomic_buffer_ptr) + index;
 #ifdef USE_SENDER_BARRIER
       if (aimm.IsCombine()) value = 1;
+#ifdef USE_CXI
+      uint32_t const tag = wr_tag(cqe.wr_id);
+      ProxyCtx& S_rep = *ctx_by_tag[tag];
+      S_rep.pool_index = (S_rep.pool_index + 1) % (kRemoteBufferSize / kObjectSize - 1);
+      uint64_t r_wr_id = make_wr_id(tag, S_rep.pool_index);
+      int ret = fi_recv(S_rep.ep, S_rep.local_addr, 0, fi_mr_desc(S_rep.fi_mr), FI_ADDR_UNSPEC, (void*)r_wr_id);
+      if (ret != 0) {
+        fprintf(stderr, "fi_recv (atomics replenish) failed: %d (%s)\n", ret, fi_strerror(-ret));
+        std::abort();
+      }
+      continue;
+#else
 #ifndef EFA
       uint32_t const tag = wr_tag(cqe.wr_id);
       ProxyCtx& S_atomic = *ctx_by_tag[tag];
@@ -2560,6 +2622,7 @@ void remote_process_completions_fast_mode(
         std::abort();
       }
       continue;
+#endif
 #endif
 #endif
       if (value == kMaxSendAtomicValue) value = kLargeAtomicValue;
@@ -2632,6 +2695,23 @@ void remote_process_completions_fast_mode(
       fprintf(stderr, "Unexpected CQE opcode: %d\n", cqe.opcode);
       std::abort();
     }
+#ifdef USE_CXI
+    if (cqe.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+      uint32_t const tag = wr_tag(cqe.wr_id);
+      if (tag >= ctx_by_tag.size() || ctx_by_tag[tag] == nullptr) {
+        fprintf(stderr, "Invalid tag or uninitialized context for tag=%u\n", tag);
+        std::abort();
+      }
+      ProxyCtx& S_rep = *ctx_by_tag[tag];
+      S_rep.pool_index = (S_rep.pool_index + 1) % (kRemoteBufferSize / kObjectSize - 1);
+      uint64_t r_wr_id = make_wr_id(tag, S_rep.pool_index);
+      int ret = fi_recv(S_rep.ep, S_rep.local_addr, 0, fi_mr_desc(S_rep.fi_mr), FI_ADDR_UNSPEC, (void*)r_wr_id);
+      if (ret != 0) {
+        fprintf(stderr, "fi_recv (imm replenish) failed: %d (%s)\n", ret, fi_strerror(-ret));
+        std::abort();
+      }
+    }
+#else
 #ifndef EFA
     if (cqe.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
       uint32_t const tag = wr_tag(cqe.wr_id);
@@ -2669,6 +2749,7 @@ void remote_process_completions_fast_mode(
       }
     }
 #endif
+#endif
   }
 }
 
@@ -2688,6 +2769,7 @@ void remote_process_completions(
   }
 }
 
+#ifndef USE_CXI
 void remote_poll_completions(ProxyCtx& S, int idx, CopyRingBuffer& g_ring,
                              std::vector<ProxyCtx*>& ctx_by_tag,
                              void* atomic_buffer_ptr, int num_ranks,
@@ -2707,7 +2789,10 @@ void remote_poll_completions(ProxyCtx& S, int idx, CopyRingBuffer& g_ring,
   if (get_cq(S)) poll_one(get_cq(S));
   // for (auto* cq : S.extra_cqs) poll_one(cq);
 }
+#endif
 
+
+#ifndef USE_CXI
 void remote_reg_ack_buf(ibv_pd* pd, uint64_t* ack_buf, ibv_mr*& ack_mr) {
   if (ack_mr) return;
   ack_mr = ibv_reg_mr(pd, ack_buf, sizeof(uint64_t) * RECEIVER_BATCH_SIZE,
@@ -2818,8 +2903,10 @@ void local_post_ack_buf(ProxyCtx& S, int depth) {
     }
   }
 }
+#endif // !USE_CXI
 
 // Normal mode implementation
+#ifndef USE_CXI
 static void post_atomic_operations_normal_mode(
     ProxyCtx& S, std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post,
@@ -3479,3 +3566,466 @@ void post_atomic_operations(ProxyCtx& S,
 #endif
   }
 }
+#endif // !USE_CXI
+
+#ifdef USE_CXI
+void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
+                          int thread_idx, int local_rank) {
+  if (S.fabric) return; // already initialized
+
+  struct fi_info* hints = fi_allocinfo();
+  if (!hints) {
+    fprintf(stderr, "fi_allocinfo failed\n");
+    std::abort();
+  }
+  hints->fabric_attr->prov_name = strdup("cxi");
+  hints->ep_attr->type = FI_EP_RDM;
+  hints->caps = FI_TAGGED | FI_MSG | FI_HMEM | FI_RMA | FI_READ | FI_WRITE |
+                FI_REMOTE_WRITE | FI_DIRECTED_RECV | FI_LOCAL_COMM | FI_REMOTE_COMM;
+  hints->mode = 0; // Zero-context mode
+  hints->domain_attr->threading = FI_THREAD_SAFE;
+  hints->domain_attr->control_progress = FI_PROGRESS_UNSPEC;
+  hints->domain_attr->data_progress = FI_PROGRESS_UNSPEC;
+  hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_ENDPOINT |
+                                FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+  hints->domain_attr->mr_key_size = 2;
+  hints->tx_attr->msg_order = FI_ORDER_SAS;
+  hints->rx_attr->msg_order = FI_ORDER_SAS;
+
+  int ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, hints, &S.fi_info);
+  if (ret != 0) {
+    fprintf(stderr, "fi_getinfo failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+
+  ret = fi_fabric(S.fi_info->fabric_attr, &S.fabric, nullptr);
+  if (ret != 0) {
+    fprintf(stderr, "fi_fabric failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+  ret = fi_domain(S.fabric, S.fi_info, &S.domain, nullptr);
+  if (ret != 0) {
+    fprintf(stderr, "fi_domain failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+  ret = fi_endpoint(S.domain, S.fi_info, &S.ep, nullptr);
+  if (ret != 0) {
+    fprintf(stderr, "fi_endpoint failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+
+  struct fi_cq_attr cq_attr;
+  memset(&cq_attr, 0, sizeof(cq_attr));
+  cq_attr.format = FI_CQ_FORMAT_DATA;
+  cq_attr.size = 10240;
+  ret = fi_cq_open(S.domain, &cq_attr, &S.cq, nullptr);
+  if (ret != 0) {
+    fprintf(stderr, "fi_cq_open failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+  ret = fi_ep_bind(S.ep, &S.cq->fid, FI_TRANSMIT | FI_RECV);
+  if (ret != 0) {
+    fprintf(stderr, "fi_ep_bind (CQ) failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+
+  struct fi_av_attr av_attr;
+  memset(&av_attr, 0, sizeof(av_attr));
+  av_attr.type = FI_AV_TABLE;
+  ret = fi_av_open(S.domain, &av_attr, &S.av, nullptr);
+  if (ret != 0) {
+    fprintf(stderr, "fi_av_open failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+  ret = fi_ep_bind(S.ep, &S.av->fid, 0);
+  if (ret != 0) {
+    fprintf(stderr, "fi_ep_bind (AV) failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+
+  bool optval = false;
+  ret = fi_setopt(&S.ep->fid, FI_OPT_ENDPOINT, FI_OPT_CUDA_API_PERMITTED, &optval, sizeof(optval));
+  if (ret != 0) {
+    fprintf(stderr, "fi_setopt(FI_OPT_CUDA_API_PERMITTED=false) returned %d (%s)\n", ret, fi_strerror(-ret));
+  }
+
+  ret = fi_enable(S.ep);
+  if (ret != 0) {
+    fprintf(stderr, "fi_enable failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+
+  if (gpu_buf && bytes > 0) {
+    struct iovec iov;
+    iov.iov_base = gpu_buf;
+    iov.iov_len = bytes;
+    struct fi_mr_attr mr_attr;
+    memset(&mr_attr, 0, sizeof(mr_attr));
+    mr_attr.mr_iov = &iov;
+    mr_attr.iov_count = 1;
+    mr_attr.access = FI_SEND | FI_RECV | FI_READ | FI_WRITE | FI_REMOTE_WRITE | FI_REMOTE_READ;
+
+    cudaPointerAttributes attr;
+    bool is_host = false;
+    if (cudaPointerGetAttributes(&attr, gpu_buf) == cudaSuccess) {
+#if defined(__HIP_PLATFORM_AMD__) || (defined(CUDART_VERSION) && CUDART_VERSION >= 10000)
+      is_host = (attr.type == cudaMemoryTypeHost);
+#else
+      is_host = (attr.memoryType == cudaMemoryTypeHost);
+#endif
+    }
+
+    if (is_host) {
+      mr_attr.iface = FI_HMEM_SYSTEM;
+    } else {
+      mr_attr.iface = FI_HMEM_CUDA;
+      mr_attr.device.cuda = local_rank;
+    }
+
+    ret = fi_mr_regattr(S.domain, &mr_attr, 0, &S.fi_mr);
+    if (ret != 0) {
+      fprintf(stderr, "fi_mr_regattr failed: %d (%s)\n", ret, fi_strerror(-ret));
+      std::abort();
+    }
+    if (S.fi_info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+      ret = fi_mr_bind(S.fi_mr, &S.ep->fid, 0);
+      if (ret == 0) ret = fi_mr_enable(S.fi_mr);
+      if (ret != 0) {
+        fprintf(stderr, "fi_mr_bind/enable failed: %d (%s)\n", ret, fi_strerror(-ret));
+        std::abort();
+      }
+    }
+    S.rkey = (uint32_t)fi_mr_key(S.fi_mr);
+    fprintf(stderr, "[CXI] Registered GPU memory MR. key = %x\n", S.rkey);
+  }
+
+  S.local_addr = gpu_buf;
+  S.local_len = bytes;
+  fi_freeinfo(hints);
+}
+
+void create_per_thread_qp(ProxyCtx& S, void* gpu_buffer, size_t size,
+                          RDMAConnectionInfo* local_info, int rank,
+                          size_t num_rings, bool use_normal_mode,
+                          void* atomic_buffer_ptr) {
+  local_info->addr = reinterpret_cast<uintptr_t>(gpu_buffer);
+  local_info->len = size;
+  local_info->rkey = S.rkey;
+
+  size_t temp_len = sizeof(local_info->fi_addr);
+  int ret = fi_getname(&S.ep->fid, local_info->fi_addr, &temp_len);
+  if (ret != 0) {
+    fprintf(stderr, "fi_getname failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+  local_info->fi_addr_len = static_cast<uint32_t>(temp_len);
+
+  if (atomic_buffer_ptr && S.fi_atomic_mr) {
+    local_info->atomic_buffer_addr = reinterpret_cast<uintptr_t>(atomic_buffer_ptr);
+    local_info->atomic_buffer_len = kAtomicBufferSize;
+    local_info->atomic_buffer_rkey = (uint32_t)fi_mr_key(S.fi_atomic_mr);
+  } else {
+    local_info->atomic_buffer_addr = 0;
+    local_info->atomic_buffer_len = 0;
+    local_info->atomic_buffer_rkey = 0;
+  }
+}
+
+void modify_qp_to_init(ProxyCtx& S) {}
+
+void modify_qp_to_rtr(ProxyCtx& S, RDMAConnectionInfo* remote,
+                      bool use_normal_mode) {
+  fi_addr_t peer_addr;
+  int ret = fi_av_insert(S.av, remote->fi_addr, 1, &peer_addr, 0, nullptr);
+  if (ret != 1) {
+    fprintf(stderr, "fi_av_insert failed: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+  if (S.peer_fi_addrs.size() <= S.tag) {
+    S.peer_fi_addrs.resize(S.tag + 1, FI_ADDR_UNSPEC);
+  }
+  S.peer_fi_addrs[0] = peer_addr;
+  S.peer_fi_addrs[S.tag] = peer_addr;
+}
+
+void modify_qp_to_rts(ProxyCtx& S, RDMAConnectionInfo* local_info) {}
+
+void post_receive_buffer_for_imm(ProxyCtx& S) {
+  uint32_t tag = S.tag;
+  int num_recvs = kMaxOutstandingRecvs;
+  for (int i = 0; i < num_recvs; ++i) {
+    uint64_t r_wr_id = make_wr_id(tag, static_cast<uint32_t>(i));
+    int ret = fi_recv(S.ep, S.local_addr, 0, fi_mr_desc(S.fi_mr), FI_ADDR_UNSPEC, reinterpret_cast<void*>(r_wr_id));
+    if (ret != 0) {
+      fprintf(stderr, "fi_recv (initial) failed for tag=%u, i=%d: %d (%s)\n", tag, i, ret, fi_strerror(-ret));
+      std::abort();
+    }
+  }
+}
+
+void post_rdma_async_batched(
+    ProxyCtx& S, void* buf, size_t num_wrs,
+    std::vector<uint64_t> const& wrs_to_post,
+    std::vector<TransferCmd> const& cmds_to_post,
+    std::vector<std::unique_ptr<ProxyCtx>>& ctxs, int my_rank, int thread_idx,
+    bool use_normal_mode) {
+  if (num_wrs == 0) return;
+  if (wrs_to_post.size() != num_wrs || cmds_to_post.size() != num_wrs) {
+    fprintf(stderr, "Size mismatch (num_wrs=%zu, wr_ids=%zu, cmds=%zu)\n",
+            num_wrs, wrs_to_post.size(), cmds_to_post.size());
+    std::abort();
+  }
+
+  std::unordered_map<int, std::vector<size_t>> dst_rank_wr_ids;
+  for (size_t i = 0; i < num_wrs; ++i) {
+    dst_rank_wr_ids[cmds_to_post[i].dst_rank].push_back(i);
+  }
+
+  for (auto& [dst_rank, wr_ids] : dst_rank_wr_ids) {
+    if (wr_ids.empty()) continue;
+
+    ProxyCtx* ctx = ctxs[dst_rank].get();
+    if (!ctx || !ctx->fi_mr) {
+      fprintf(stderr, "Destination ctx or fi_mr missing for dst=%d\n", dst_rank);
+      std::abort();
+    }
+
+    fi_addr_t peer_addr = FI_ADDR_UNSPEC;
+    if (ctx->peer_fi_addrs.size() > 0) {
+      peer_addr = ctx->peer_fi_addrs[0];
+    }
+    if (peer_addr == FI_ADDR_UNSPEC) {
+      if (S.peer_fi_addrs.size() > static_cast<size_t>(dst_rank)) {
+        peer_addr = S.peer_fi_addrs[dst_rank];
+      }
+    }
+    if (peer_addr == FI_ADDR_UNSPEC) {
+      fprintf(stderr, "[CXI] peer_addr is FI_ADDR_UNSPEC for dst=%d\n", dst_rank);
+      std::abort();
+    }
+
+    size_t const k = wr_ids.size();
+    for (size_t j = 0; j < k; ++j) {
+      size_t i = wr_ids[j];
+      auto const& cmd = cmds_to_post[i];
+      uint64_t wr_id = wrs_to_post[i];
+
+      uint64_t remote_addr = ctx->remote_addr + decode_write_offset(cmd.req_rptr, !use_normal_mode);
+      uintptr_t laddr = decode_write_offset(cmd.req_lptr, !use_normal_mode) + reinterpret_cast<uintptr_t>(S.local_addr);
+
+#ifdef USE_SENDER_BARRIER
+      if (!use_normal_mode) {
+        uint32_t sb_expert = unpack_ll_expert(cmd.expert_idx);
+        S.wr_id_to_write_struct[wr_id] = {
+            static_cast<uint16_t>(sb_expert), dst_rank,
+            get_is_combine(cmd.cmd_type), true};
+      }
+#endif
+
+      int ret = 0;
+      if (use_normal_mode) {
+        if (cmd.atomic_offset > 0 && cmd.atomic_val > 0) {
+          int v = static_cast<int>(cmd.atomic_val);
+          size_t index = static_cast<size_t>(cmd.atomic_offset / sizeof(int64_t));
+          auto key = ctx->seq_key(dst_rank, index);
+          if (ctx->next_seq_per_index.find(key) == ctx->next_seq_per_index.end()) {
+            ctx->next_seq_per_index[key] = 0;
+          }
+          uint8_t seq = ctx->next_seq_per_index[key];
+          ctx->next_seq_per_index[key] = (seq + 1) % kReorderingBufferSize;
+          uint32_t imm = AtomicsImm::PackAtomicWithSeq(v, cmd.atomic_offset, seq, true).GetImmData();
+
+          ret = fi_writedata(S.ep, reinterpret_cast<void*>(laddr), cmd.bytes, fi_mr_desc(S.fi_mr),
+                             imm, peer_addr, remote_addr, ctx->remote_rkey, reinterpret_cast<void*>(wr_id));
+        } else if (j + 1 == k) {
+          uint32_t imm = WriteImm::Pack(get_is_combine(cmd.cmd_type),
+                                        get_low_latency(cmd.cmd_type),
+                                        cmd.expert_idx & WriteImm::kEXPERT_MASK,
+                                        (uint32_t)k, my_rank)
+                             .GetImmData();
+          ret = fi_writedata(S.ep, reinterpret_cast<void*>(laddr), cmd.bytes, fi_mr_desc(S.fi_mr),
+                             imm, peer_addr, remote_addr, ctx->remote_rkey, reinterpret_cast<void*>(wr_id));
+        } else {
+          ret = fi_write(S.ep, reinterpret_cast<void*>(laddr), cmd.bytes, fi_mr_desc(S.fi_mr),
+                         peer_addr, remote_addr, ctx->remote_rkey, reinterpret_cast<void*>(wr_id));
+        }
+      } else {
+        if (j + 1 == k) {
+          uint32_t ll_expert = unpack_ll_expert(cmd.expert_idx);
+          uint32_t imm = WriteImm::Pack(get_is_combine(cmd.cmd_type),
+                                        get_low_latency(cmd.cmd_type), ll_expert, k, my_rank)
+                             .GetImmData();
+          ret = fi_writedata(S.ep, reinterpret_cast<void*>(laddr), cmd.bytes, fi_mr_desc(S.fi_mr),
+                             imm, peer_addr, remote_addr, ctx->remote_rkey, reinterpret_cast<void*>(wr_id));
+        } else {
+          ret = fi_write(S.ep, reinterpret_cast<void*>(laddr), cmd.bytes, fi_mr_desc(S.fi_mr),
+                         peer_addr, remote_addr, ctx->remote_rkey, reinterpret_cast<void*>(wr_id));
+        }
+      }
+
+      if (ret != 0) {
+        fprintf(stderr, "fi_write/writedata failed: %d (%s)\n", ret, fi_strerror(-ret));
+        std::abort();
+      }
+    }
+  }
+}
+
+int poll_cq_once(fid_cq* cq, ibv_wc* wc, int max_cqes) {
+  std::vector<fi_cq_data_entry> entries(max_cqes);
+  ssize_t rc = fi_cq_read(cq, entries.data(), max_cqes);
+  if (rc == -FI_EAGAIN) {
+    return 0;
+  }
+  if (rc == -FI_EAVAIL) {
+    struct fi_cq_err_entry err;
+    std::memset(&err, 0, sizeof(err));
+    fi_cq_readerr(cq, &err, 0);
+    fprintf(stderr, "CXI CQ error: err=%d prov_errno=%d %s\n",
+            err.err, err.prov_errno, fi_cq_strerror(cq, err.prov_errno, err.err_data, nullptr, 0));
+    std::abort();
+  }
+  if (rc < 0) {
+    fprintf(stderr, "fi_cq_read failed: %zd (%s)\n", rc, fi_strerror(-rc));
+    std::abort();
+  }
+
+  for (ssize_t i = 0; i < rc; ++i) {
+    wc[i].wr_id = reinterpret_cast<uint64_t>(entries[i].op_context);
+    wc[i].status = IBV_WC_SUCCESS;
+    wc[i].byte_len = static_cast<uint32_t>(entries[i].len);
+    wc[i].vendor_err = 0;
+    wc[i].qp_num = 0;
+
+    if (entries[i].flags & FI_RECV) {
+      wc[i].opcode = IBV_WC_RECV_RDMA_WITH_IMM;
+      wc[i].imm_data = htonl(entries[i].data);
+    } else {
+      wc[i].opcode = IBV_WC_RDMA_WRITE;
+    }
+  }
+  return static_cast<int>(rc);
+}
+
+void local_poll_completions(ProxyCtx& S,
+                            std::unordered_set<uint64_t>& acked_wrs,
+                            int thread_idx,
+                            std::vector<ProxyCtx*>& ctx_by_tag) {
+  ibv_wc wc[kMaxOutstandingSends];
+  if (S.cq) {
+    int ne = poll_cq_once(S.cq, wc, kMaxOutstandingSends);
+    if (ne > 0) {
+      local_process_completions(S, acked_wrs, thread_idx, wc, ne, ctx_by_tag);
+    }
+  }
+}
+
+void poll_cq_dual(ProxyCtx& S, std::unordered_set<uint64_t>& acked_wrs,
+                  int thread_idx, CopyRingBuffer& g_ring,
+                  std::vector<ProxyCtx*>& ctx_by_tag, void* atomic_buffer_ptr,
+                  int num_ranks, int num_experts,
+                  std::set<PendingUpdate>& pending_atomic_updates, int my_rank,
+                  int num_nodes, EPAdaptiveSleeper& adaptive_sleeper,
+                  bool use_normal_mode) {
+  ibv_wc wc[kMaxOutstandingSends];
+  if (S.cq) {
+    int ne = poll_cq_once(S.cq, wc, kMaxOutstandingSends);
+    if (ne > 0) {
+      local_process_completions(S, acked_wrs, thread_idx, wc, ne, ctx_by_tag);
+      remote_process_completions(S, thread_idx, g_ring, ne, wc, ctx_by_tag,
+                                 atomic_buffer_ptr, num_ranks, num_experts,
+                                 pending_atomic_updates, my_rank, num_nodes,
+                                 use_normal_mode);
+      adaptive_sleeper.update_timer();
+    }
+  }
+}
+
+void remote_poll_completions(ProxyCtx& S, int idx, CopyRingBuffer& g_ring,
+                             std::vector<ProxyCtx*>& ctx_by_tag,
+                             void* atomic_buffer_ptr, int num_ranks,
+                             int num_experts,
+                             std::set<PendingUpdate>& pending_atomic_updates,
+                             int my_rank, int num_nodes, bool use_normal_mode) {
+  ibv_wc wc[kMaxOutstandingRecvs];
+  if (S.cq) {
+    int ne = poll_cq_once(S.cq, wc, kMaxOutstandingRecvs);
+    if (ne > 0) {
+      remote_process_completions(S, idx, g_ring, ne, wc, ctx_by_tag,
+                                 atomic_buffer_ptr, num_ranks, num_experts,
+                                 pending_atomic_updates, my_rank, num_nodes,
+                                 use_normal_mode);
+    }
+  }
+}
+
+void post_atomic_operations(ProxyCtx& S,
+                            std::vector<uint64_t> const& wrs_to_post,
+                            std::vector<TransferCmd> const& cmds_to_post,
+                            std::vector<std::unique_ptr<ProxyCtx>>& ctxs,
+                            int my_rank, int thread_idx,
+                            std::unordered_set<uint64_t>& acked_wrs,
+                            bool use_normal_mode) {
+  if (cmds_to_post.empty()) return;
+
+  std::unordered_map<int, std::vector<size_t>> dst_rank_wr_ids;
+  for (size_t i = 0; i < cmds_to_post.size(); ++i) {
+    dst_rank_wr_ids[cmds_to_post[i].dst_rank].push_back(i);
+  }
+
+  for (auto& [dst_rank, wr_ids] : dst_rank_wr_ids) {
+    if (wr_ids.empty()) continue;
+
+    ProxyCtx* ctx = ctxs[dst_rank].get();
+    if (!ctx || !ctx->fi_mr) {
+      fprintf(stderr, "Destination ctx or fi_mr missing for dst=%d\n", dst_rank);
+      std::abort();
+    }
+
+    fi_addr_t peer_addr = FI_ADDR_UNSPEC;
+    if (ctx->peer_fi_addrs.size() > 0) {
+      peer_addr = ctx->peer_fi_addrs[0];
+    }
+    if (peer_addr == FI_ADDR_UNSPEC) {
+      if (S.peer_fi_addrs.size() > static_cast<size_t>(dst_rank)) {
+        peer_addr = S.peer_fi_addrs[dst_rank];
+      }
+    }
+    if (peer_addr == FI_ADDR_UNSPEC) {
+      fprintf(stderr, "[CXI] peer_addr is FI_ADDR_UNSPEC for dst=%d\n", dst_rank);
+      std::abort();
+    }
+
+    for (size_t idx : wr_ids) {
+      auto const& cmd = cmds_to_post[idx];
+      uint64_t const wr_id = wrs_to_post[idx];
+
+      int v = static_cast<int>(cmd.value);
+      if (v > kLargeAtomicValue) v = kMaxSendAtomicValue;
+      if (v < -kMaxSendAtomicValue || v > kMaxSendAtomicValue) {
+        fprintf(stderr, "value=%d won't fit in 15 bits for imm\n", v);
+        std::abort();
+      }
+
+      uint32_t offset = static_cast<uint32_t>(cmd.req_rptr);
+      uint32_t imm = AtomicsImm::PackAtomic(v, offset).GetImmData();
+      uint64_t tagged_wr_id = kAtomicWrTag | (wr_id & kAtomicMask);
+
+      int ret = fi_writedata(S.ep, nullptr, 0, nullptr, imm, peer_addr,
+                             ctx->remote_addr, ctx->remote_rkey, reinterpret_cast<void*>(tagged_wr_id));
+      if (ret != 0) {
+        fprintf(stderr, "[CXI] fi_writedata (atomic) failed: %d (%s)\n", ret, fi_strerror(-ret));
+        std::abort();
+      }
+    }
+  }
+}
+
+bool can_register_gpu_memory_for_rdma(int gpu_idx, size_t bytes) {
+  return true;
+}
+
+bool can_register_gpu_memory_for_atomics(int gpu_idx) {
+  return true;
+}
+#endif

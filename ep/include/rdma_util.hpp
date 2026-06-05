@@ -1,6 +1,7 @@
 #ifndef RDMA_UTIL_HPP
 #define RDMA_UTIL_HPP
 
+#ifndef USE_CXI
 #include "rdma.hpp"
 #include <arpa/inet.h>
 #include <infiniband/verbs.h>
@@ -65,7 +66,7 @@ void fill_local_gid(ProxyCtx& S, RDMAConnectionInfo* local_info) {
       //     "[RDMA] Local GID filled for InfiniBand connection: "
       //     "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%"
       //     "02x\n",
-      //     local_info->gid[0], local_info->gid[1], local_info->gid[2],
+      //     local_info->gid[0], local_info->gid[1], local_gid.raw[2],
       //     local_info->gid[3], local_info->gid[4], local_info->gid[5],
       //     local_info->gid[6], local_info->gid[7], local_info->gid[8],
       //     local_info->gid[9], local_info->gid[10], local_info->gid[11],
@@ -384,5 +385,6 @@ static bool ncclIbGetGidIndex(struct ibv_context* context, uint8_t portNum,
           *gidIndex, deviceName ? deviceName : "unknown");
   return true;
 }
+#endif // !USE_CXI
 
 #endif  // RDMA_UTIL_HPP

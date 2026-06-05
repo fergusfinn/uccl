@@ -244,6 +244,21 @@ if __name__ == "__main__":
         else:
             print("Building without DMA-BUF GPU memory registration")
 
+        # CXI transport support via Libfabric.
+        # Set USE_CXI=1 to compile with CXI.
+        use_cxi = int(os.getenv("USE_CXI", "0"))
+        if use_cxi:
+            print("Building with CXI transport (USE_CXI)")
+            cxx_flags.append("-DUSE_CXI")
+            nvcc_flags.append("-DUSE_CXI")
+            libfabric_home = os.getenv("LIBFABRIC_HOME", "/opt/libfabric")
+            if os.path.exists(libfabric_home):
+                include_dirs.append(Path(libfabric_home) / "include")
+                library_dirs.append(Path(libfabric_home) / "lib")
+            libraries.append("fabric")
+        else:
+            print("Building without CXI transport")
+
         # Add GH200 flags if detected
         if has_gh200:
             cxx_flags.append("-DUSE_GRACE_HOPPER")
@@ -428,6 +443,7 @@ if __name__ == "__main__":
         print(f" > EFA Support: {'Yes' if has_efa else 'No'}")
         print(f" > GH200 Support: {'Yes' if has_gh200 else 'No'}")
         print(f" > DMA-BUF Support: {'Yes' if use_dmabuf else 'No'}")
+        print(f" > CXI Support: {'Yes' if use_cxi else 'No'}")
     print(f" > Device Arch: {device_arch}")
     print(f" > Sources: {len(sources)} files")
     print(f" > Headers (tracked): {len(header_files)} files")

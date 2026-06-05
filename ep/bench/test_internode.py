@@ -97,7 +97,7 @@ def test_main(
         args.num_experts,
     )
 
-    assert num_experts % num_ranks == 0 and num_local_ranks == 8
+    assert num_experts % num_ranks == 0 and num_local_ranks in (4, 8)
     if local_rank == 0:
         print(
             f"[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}",
@@ -567,7 +567,7 @@ def test_loop(
         explicitly_destroy=True,
     )
 
-    assert num_local_ranks == 8 and num_ranks > 8
+    assert num_local_ranks in (4, 8) and num_ranks >= 8
 
     for seed in range(int(1e9)):
         if local_rank == 0:

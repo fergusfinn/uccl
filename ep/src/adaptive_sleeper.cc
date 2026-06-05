@@ -13,6 +13,7 @@ EPAdaptiveSleeper::EPAdaptiveSleeper()
 EPAdaptiveSleeper::~EPAdaptiveSleeper() { close(work_eventfd_); }
 
 void EPAdaptiveSleeper::maybe_sleep(ProxyCtx& proxy_ctx) {
+#ifndef USE_CXI
   int ret;
 
   if (std::chrono::steady_clock::now() - last_event_time_ >=
@@ -69,6 +70,7 @@ void EPAdaptiveSleeper::maybe_sleep(ProxyCtx& proxy_ctx) {
           << "Proxy thread woke due to poll timeout, sleeping again";
     }
   }
+#endif
 }
 
 void EPAdaptiveSleeper::maybe_wake_proxy_thread() {

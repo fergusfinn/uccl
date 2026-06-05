@@ -189,6 +189,51 @@ void Proxy::init_common() {
   per_thread_rdma_init(ctx_, cfg_.gpu_buffer, cfg_.total_size, my_rank,
                        cfg_.thread_idx, cfg_.local_rank);
   pin_thread_to_numa_wrapper();
+#ifdef USE_CXI
+  // Under USE_CXI, CQ and MR initialization is handled by per_thread_rdma_init
+  if (atomic_buffer_ptr_ && !ctx_.fi_atomic_mr) {
+    struct iovec iov;
+    iov.iov_base = atomic_buffer_ptr_;
+    iov.iov_len = kAtomicBufferSize;
+    struct fi_mr_attr mr_attr;
+    memset(&mr_attr, 0, sizeof(mr_attr));
+    mr_attr.mr_iov = &iov;
+    mr_attr.iov_count = 1;
+    mr_attr.access = FI_SEND | FI_RECV | FI_READ | FI_WRITE | FI_REMOTE_WRITE | FI_REMOTE_READ;
+    
+    cudaPointerAttributes attr;
+    bool is_host = false;
+    if (cudaPointerGetAttributes(&attr, atomic_buffer_ptr_) == cudaSuccess) {
+#if defined(__HIP_PLATFORM_AMD__) || (defined(CUDART_VERSION) && CUDART_VERSION >= 10000)
+      is_host = (attr.type == cudaMemoryTypeHost);
+#else
+      is_host = (attr.memoryType == cudaMemoryTypeHost);
+#endif
+    }
+    
+    if (is_host) {
+      mr_attr.iface = FI_HMEM_SYSTEM;
+    } else {
+      mr_attr.iface = FI_HMEM_CUDA;
+      mr_attr.device.cuda = cfg_.local_rank;
+    }
+
+    int ret = fi_mr_regattr(ctx_.domain, &mr_attr, 0, &ctx_.fi_atomic_mr);
+    if (ret != 0) {
+      fprintf(stderr, "fi_mr_regattr for atomic buffer failed: %d (%s)\n", ret, fi_strerror(-ret));
+      exit(1);
+    }
+    if (ctx_.fi_info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+      ret = fi_mr_bind(ctx_.fi_atomic_mr, &ctx_.ep->fid, 0);
+      if (ret == 0) ret = fi_mr_enable(ctx_.fi_atomic_mr);
+      if (ret != 0) {
+        fprintf(stderr, "fi_mr_bind/enable for atomic buffer failed: %d (%s)\n", ret, fi_strerror(-ret));
+        exit(1);
+      }
+    }
+    fprintf(stderr, "[Proxy/CXI] Registered atomic buffer MR. key = %x\n", (uint32_t)fi_mr_key(ctx_.fi_atomic_mr));
+  }
+#else
   if (!get_cq(ctx_)) {
     (void)create_per_thread_comp_channel(ctx_);
     (void)create_per_thread_cq(ctx_);
@@ -219,6 +264,7 @@ void Proxy::init_common() {
             (unsigned long long)ctx_.atomic_buffer_mr->addr,
             (size_t)ctx_.atomic_buffer_mr->length, ctx_.atomic_buffer_mr->rkey);
   }
+#endif
 
   if (ctxs_for_all_ranks_.empty()) {
     fprintf(stderr,
@@ -232,6 +278,7 @@ void Proxy::init_common() {
   // NOTE: This must NOT alias cfg_.gpu_buffer (which is used for other
   // layouts). For IBV_WR_ATOMIC_FETCH_AND_ADD the NIC DMA-writes the old value
   // here.
+#ifndef USE_CXI
   if (!ctx_.atomic_old_values_buf || !ctx_.atomic_old_values_mr) {
     size_t const atomic_buf_size = ProxyCtx::kMaxAtomicOps * sizeof(uint64_t);
     void* p = nullptr;
@@ -252,6 +299,7 @@ void Proxy::init_common() {
       std::abort();
     }
   }
+#endif
 
   int num_ranks = ctxs_for_all_ranks_.size();
   local_infos_.assign(num_ranks, RDMAConnectionInfo{});
@@ -292,21 +340,44 @@ void Proxy::init_common() {
     if (c.tag >= ctx_by_tag_.size()) ctx_by_tag_.resize(c.tag + 1, nullptr);
     ctx_by_tag_[c.tag] = &c;
 
+#ifdef USE_CXI
+    c.fi_info = ctx_.fi_info;
+    c.fabric = ctx_.fabric;
+    c.domain = ctx_.domain;
+    c.ep = ctx_.ep;
+    c.cq = ctx_.cq;
+    c.av = ctx_.av;
+    c.fi_mr = ctx_.fi_mr;
+    c.fi_atomic_mr = ctx_.fi_atomic_mr;
+    c.local_addr = ctx_.local_addr;
+    c.local_len = ctx_.local_len;
+#else
     c.context = ctx_.context;
     c.pd = ctx_.pd;
     c.mr = ctx_.mr;
+#endif
     c.rkey = ctx_.rkey;
 #ifdef USE_DMABUF
     c.gpu_mr_chunks = ctx_.gpu_mr_chunks;
 #endif
     // Share cq/pd/mr; non-EFA QPs are per-peer, EFA QPs are aliased below.
+#ifndef USE_CXI
     c.cq = ctx_.cq;
+#endif
+#ifndef USE_CXI
     c.cq_ex = ctx_.cq_ex;
+#endif
     // Share the atomic buffer MR with peer contexts
+#ifdef USE_CXI
+    c.fi_atomic_mr = ctx_.fi_atomic_mr;
+#else
     c.atomic_buffer_mr = ctx_.atomic_buffer_mr;
+#endif
     // Share local atomic scratch buffer MR (used for native atomics)
+#ifndef USE_CXI
     c.atomic_old_values_buf = ctx_.atomic_old_values_buf;
     c.atomic_old_values_mr = ctx_.atomic_old_values_mr;
+#endif
 
     if (peer == my_rank) continue;
     // Skip rdma connection for intra-node.
@@ -512,11 +583,13 @@ void Proxy::init_remote() {
   init_common();
   assert(cfg_.rank == 1);
   auto& ctx_ptr = ctxs_for_all_ranks_[0];
+#ifndef USE_CXI
 #ifndef EFA
   local_post_ack_buf(*ctx_ptr, kSenderAckQueueDepth);
 #endif
   remote_reg_ack_buf(ctx_ptr->pd, ring.ack_buf, ring.ack_mr);
   ring.ack_qp = ctx_ptr->ack_qp;
+#endif // !USE_CXI
 #ifndef EFA
   post_receive_buffer_for_imm(*ctx_ptr);
 #endif
@@ -561,12 +634,14 @@ void Proxy::run_dual() {
       continue;
     auto& ctx_ptr = ctxs_for_all_ranks_[peer];
     if (!ctx_ptr) continue;
+#ifndef USE_CXI
 #ifndef EFA
     // EFA: posted once on the shared recv_ack_qp in init_common.
     local_post_ack_buf(*ctx_ptr, kSenderAckQueueDepth);
 #endif
     remote_reg_ack_buf(ctx_ptr->pd, ring.ack_buf, ring.ack_mr);
     ring.ack_qp = ctx_ptr->ack_qp;
+#endif // !USE_CXI
 #ifndef EFA
     post_receive_buffer_for_imm(*ctx_ptr);
 #endif
@@ -1104,6 +1179,75 @@ void Proxy::quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds) {
   acked_wrs_.insert(wrs[0]);
 }
 
+#ifdef USE_CXI
+void Proxy::destroy(bool free_gpu_buffer) {
+  if (ctx_.fi_atomic_mr) {
+    fi_close(&ctx_.fi_atomic_mr->fid);
+    ctx_.fi_atomic_mr = nullptr;
+  }
+  if (ctx_.fi_mr) {
+    fi_close(&ctx_.fi_mr->fid);
+    ctx_.fi_mr = nullptr;
+  }
+  if (ctx_.ep) {
+    fi_close(&ctx_.ep->fid);
+    ctx_.ep = nullptr;
+  }
+  if (ctx_.cq) {
+    fi_close(&ctx_.cq->fid);
+    ctx_.cq = nullptr;
+  }
+  if (ctx_.av) {
+    fi_close(&ctx_.av->fid);
+    ctx_.av = nullptr;
+  }
+  if (ctx_.domain) {
+    fi_close(&ctx_.domain->fid);
+    ctx_.domain = nullptr;
+  }
+  if (ctx_.fabric) {
+    fi_close(&ctx_.fabric->fid);
+    ctx_.fabric = nullptr;
+  }
+  if (ctx_.fi_info) {
+    fi_freeinfo(ctx_.fi_info);
+    ctx_.fi_info = nullptr;
+  }
+
+  if (free_gpu_buffer && cfg_.gpu_buffer) {
+    cudaError_t e;
+    if (cfg_.free_buffer_with_cuda_free_host) {
+      e = cudaFreeHost(cfg_.gpu_buffer);
+      if (e != cudaSuccess)
+        fprintf(stderr, "[destroy] cudaFreeHost failed: %s\n",
+                cudaGetErrorString(e));
+    } else {
+      e = cudaFree(cfg_.gpu_buffer);
+      if (e != cudaSuccess)
+        fprintf(stderr, "[destroy] cudaFree failed: %s\n",
+                cudaGetErrorString(e));
+    }
+    if (e == cudaSuccess) cfg_.gpu_buffer = nullptr;
+  }
+
+#ifndef USE_SUBSET_BARRIER
+  std::string const my_ip =
+      (cfg_.rank < (int)peers_.size()) ? peers_[cfg_.rank].ip : "";
+  std::string const shm_name =
+      shm_name_for_barrier(my_ip, cfg_.use_normal_mode, cfg_.thread_idx);
+  unmap_local_barrier_shm(shm_name, ctx_.lb, ctx_.lb_owner);
+  ctx_.lb = nullptr;
+  ctx_.lb_owner = false;
+#endif
+
+  acked_wrs_.clear();
+  wr_id_to_start_time_.clear();
+  ctxs_for_all_ranks_.clear();
+  ctx_by_tag_.clear();
+  local_infos_.clear();
+  remote_infos_.clear();
+}
+#else
 void Proxy::destroy(bool free_gpu_buffer) {
   for (auto& ctx_ptr : ctxs_for_all_ranks_) {
     if (!ctx_ptr) continue;
@@ -1302,7 +1446,41 @@ void Proxy::destroy(bool free_gpu_buffer) {
   local_infos_.clear();
   remote_infos_.clear();
 }
+#endif
 
+#ifdef USE_CXI
+void Proxy::post_barrier_msg(int dst_rank, bool ack, uint64_t seq) {
+  ProxyCtx* ctx = ctxs_for_all_ranks_[dst_rank].get();
+  if (!ctx || !ctx->fi_mr) {
+    fprintf(stderr, "barrier_msg: bad ctx or fi_mr for dst=%d\n", dst_rank);
+    std::abort();
+  }
+  uint32_t imm = BarrierImm::Pack(ack, (uint32_t)seq, (uint8_t)cfg_.rank);
+
+  fi_addr_t peer_addr = FI_ADDR_UNSPEC;
+  if (ctx->peer_fi_addrs.size() > 0) {
+    peer_addr = ctx->peer_fi_addrs[0];
+  }
+  if (peer_addr == FI_ADDR_UNSPEC) {
+    if (ctx_.peer_fi_addrs.size() > static_cast<size_t>(dst_rank)) {
+      peer_addr = ctx_.peer_fi_addrs[dst_rank];
+    }
+  }
+  if (peer_addr == FI_ADDR_UNSPEC) {
+    fprintf(stderr, "[CXI] peer_addr is FI_ADDR_UNSPEC in post_barrier_msg for dst=%d\n", dst_rank);
+    std::abort();
+  }
+
+  uint64_t tagged_wr_id = kBarrierWrTag;
+
+  int ret = fi_writedata(ctx_.ep, nullptr, 0, nullptr, imm, peer_addr,
+                         ctx->remote_addr, ctx->remote_rkey, reinterpret_cast<void*>(tagged_wr_id));
+  if (ret != 0) {
+    fprintf(stderr, "[CXI] fi_writedata failed in post_barrier_msg: %d (%s)\n", ret, fi_strerror(-ret));
+    std::abort();
+  }
+}
+#else
 void Proxy::post_barrier_msg(int dst_rank, bool ack, uint64_t seq) {
   ProxyCtx* ctx = ctxs_for_all_ranks_[dst_rank].get();
   if (!ctx || !ctx->qp || !ctx->mr) {
@@ -1354,6 +1532,7 @@ void Proxy::post_barrier_msg(int dst_rank, bool ack, uint64_t seq) {
   }
 #endif
 }
+#endif
 
 void Proxy::send_barrier(uint64_t wr) {
 #ifndef USE_MSCCLPP_FIFO_BACKEND

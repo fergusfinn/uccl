@@ -33,6 +33,10 @@ struct RDMAConnectionInfo {
   uint64_t len;
   uint16_t lid;     // Local ID
   uint8_t gid[16];  // Global ID for RoCE (optional)
+#ifdef USE_CXI
+  uint32_t fi_addr_len = 0;
+  uint8_t fi_addr[512] = {0};
+#endif
 
   // Atomic buffer info (separate from main GPU buffer)
   uint32_t atomic_buffer_rkey = 0;   // Atomic buffer memory region key
@@ -358,8 +362,10 @@ void create_per_thread_qp(ProxyCtx& S, void* gpu_buffer, size_t size,
                           RDMAConnectionInfo* local_info, int rank,
                           size_t num_rings, bool use_normal_mode,
                           void* atomic_buffer_ptr = nullptr);
+#ifndef USE_CXI
 ibv_cq* create_per_thread_cq(ProxyCtx& S);
 ibv_comp_channel* create_per_thread_comp_channel(ProxyCtx& S);
+#endif
 void remote_poll_completions(ProxyCtx& S, int idx, CopyRingBuffer& g_ring,
                              std::vector<ProxyCtx*>& ctx_by_tag,
                              void* atomic_buffer_ptr, int num_ranks,
@@ -429,6 +435,35 @@ void apply_pending_updates(ProxyCtx& ctx,
                            std::set<PendingUpdate>& pending_atomic_updates,
                            void* atomic_buffer_ptr, int num_experts,
                            int num_ranks);
+#ifdef USE_CXI
+struct fid_cq;
+int poll_cq_once(fid_cq* cq, ibv_wc* wc, int max_cqes);
+inline void drain_cq(fid_cq* cq, int empty_rounds_target = 5) {
+  if (!cq) return;
+  int empty_rounds = 0;
+  while (empty_rounds < empty_rounds_target) {
+    ibv_wc wc[64];
+    int n = poll_cq_once(cq, wc, 64);
+    if (n < 0) {
+      fprintf(stderr, "[destroy] poll_cq_once returned %d\n", n);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    if (n == 0) {
+      ++empty_rounds;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    for (int i = 0; i < n; ++i) {
+      if (wc[i].status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "CXI CQ drained err status = %d\n", wc[i].status);
+      }
+    }
+    empty_rounds = 0;
+  }
+}
+#else
 int poll_cq_once(ibv_cq* cq, ibv_wc* wc, int max_cqes);
+#endif
 
 #endif  // RDMA_HPP
