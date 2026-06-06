@@ -557,6 +557,9 @@ def initialize_uccl(
     use_normal_mode=False,
     rdma_buffer_is_host_allocated=False,
 ):
+    if hasattr(scratch_ptr, "data_ptr"):
+        scratch_ptr = scratch_ptr.data_ptr()
+
     # Only sweep barriers belonging to OUR mode so we don't stomp on a
     # coexisting Buffer of the other mode in the same process. The C++
     # shm name format is `/uccl_barrier_<ip>_uid<uid>_<ht|ll>_th<idx>`,

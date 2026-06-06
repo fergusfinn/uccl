@@ -53,7 +53,7 @@ def test_simple_internode(rank: int, num_ranks: int, group: dist.ProcessGroup):
     scratch = torch.empty(
         scratch_nbytes, dtype=torch.uint8, device=f"cuda:{device_index}"
     )
-    proxies, workers = initialize_uccl(scratch, scratch_nbytes, rank, num_ranks, group)
+    proxies, workers = initialize_uccl(scratch.data_ptr(), scratch_nbytes, rank, num_ranks, group)
 
     try:
         buffer = Buffer(
