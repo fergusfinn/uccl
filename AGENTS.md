@@ -54,6 +54,40 @@ Instead, always run the distributed tests programmatically using the virtual env
 # Verify top-level import
 python3 -c "import torch; import uccl.ep; print(uccl.ep.__file__)"
 
-# Run Intranode correctness validation on 4 GPUs
+### 1. Intranode Correctness Validation (Single-Node, 4 GPUs)
+Run the distributed intranode correctness test using PyTorch's distributed launcher from the virtual environment:
+```bash
+# Run Intranode correctness validation on 4 GPUs of the current node
 python3 -m torch.distributed.run --nproc_per_node=4 bench/test_intranode.py --num-processes 4
 ```
+
+### 2. Internode Correctness Validation (Multi-Node, 2+ Nodes)
+To validate communication across separate physical Grace Hopper nodes, use the custom `run-multinode.sh` orchestration script from the Isambard skill. 
+
+This script bind-mounts the host-native **aws-ofi-nccl** plugin and overrides the image's default TCP fallback, routing NCCL collectives directly over the ultra-fast **CXI RDMA** fabric (~150 GB/s instead of ~8 GB/s).
+
+#### Step A: Acquire a Multi-Node Slurm Allocation
+Allocate 2 nodes (8 GPUs total) under the reserved `brics_s6p` block:
+```bash
+salloc --nodes=2 --gres=gpu:4 --reservation=brics_s6p --account=brics.s6p --partition=workq --time=00:30:00
+```
+This automatically sets the necessary Slurm variables (`SLURM_JOB_ID`, list of hostnames, etc.) in your environment.
+
+#### Step B: Launch the Internode Benchmark
+Using `run-multinode.sh`, run the internode benchmark inside the development container across both allocated nodes. Prepend the command with environment activation so Python resolves the `uccl.ep` bindings in your virtual environment:
+
+```bash
+# Set work directory to the root of your repository
+export WORK=~/src/uccl
+
+# Run the full internode correctness test (8 total ranks / processes)
+~/isambard-skill/scripts/run-multinode.sh bash -c \
+  "source ep/.venv/bin/activate && python3 ep/bench/test_internode.py --num-processes 8 --num-tokens 4096"
+
+# Run the simple internode test (useful to isolate OOB network bootstrap problems)
+~/isambard-skill/scripts/run-multinode.sh bash -c \
+  "source ep/.venv/bin/activate && python3 ep/bench/test_internode_simple.py"
+```
+
+> [!NOTE]
+> `run-multinode.sh` maps each GPU rank to a separate container instance dynamically. The `--num-processes 8` argument tells the benchmark to expect a process group of size 8 (2 nodes × 4 GPUs per node).
