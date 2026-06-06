@@ -50,10 +50,15 @@ def test_simple_internode(rank: int, num_ranks: int, group: dist.ProcessGroup):
     ).multi_processor_count
 
     scratch_nbytes = int(1e9)  # 256 MB
+    scratch = torch.empty(
+        scratch_nbytes, dtype=torch.uint8, device=f"cuda:{device_index}"
+    )
+    proxies, workers = initialize_uccl(scratch, scratch_nbytes, rank, num_ranks, group)
 
     try:
         buffer = Buffer(
             group=group,
+            rdma_buffer_ptr=scratch.data_ptr(),
             num_nvl_bytes=0,
             num_rdma_bytes=int(scratch_nbytes),
             low_latency_mode=True,
@@ -62,9 +67,6 @@ def test_simple_internode(rank: int, num_ranks: int, group: dist.ProcessGroup):
             allow_mnnvl=False,
             explicitly_destroy=True,
         )
-
-        proxies = buffer.proxies
-        workers = buffer.workers
 
         if rank == 0:
             print("[simple-test] ✓ Buffer created successfully", flush=True)
