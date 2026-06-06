@@ -46,6 +46,8 @@ def hash_tensor(t: torch.Tensor):
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # Set device
+    torch.cuda.set_device(local_rank)
+    torch.set_default_device(torch.device(f"cuda:{local_rank}"))
 
     # NOTES: you may rewrite this function with your own cluster settings
     ip = os.getenv("MASTER_ADDR", "127.0.0.1")
