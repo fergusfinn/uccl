@@ -774,7 +774,7 @@ class Buffer:
         config_map = {
             2: Config(Buffer.num_sms, 10, 256, 6, 128),
             4: Config(Buffer.num_sms, 9, 256, 6, 128),
-            8: Config(Buffer.num_sms, 4, 256, 6, 128),
+            8: Config(Buffer.num_sms, 4, 256, 8, 128),
             16: Config(Buffer.num_sms, 4, 288, 12, 512 if Buffer._is_efa() else 128),
             24: Config(Buffer.num_sms, 1, 288, 8, 128),
             32: Config(Buffer.num_sms, 1, 288, 8, 512 if Buffer._is_efa() else 128),
