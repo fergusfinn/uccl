@@ -1536,7 +1536,7 @@ static void post_rdma_async_batched_cxi(
     std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post,
     std::vector<std::unique_ptr<ProxyCtx>>& ctxs, int my_rank,
-    bool use_normal_mode) {
+    bool use_normal_mode, std::atomic<bool> const* progress_run) {
   std::vector<CxiPlannedWrite> writes;
   writes.reserve(cmds_to_post.size());
 
@@ -1572,8 +1572,15 @@ static void post_rdma_async_batched_cxi(
     ProxyCtx* ctx = ctxs[cmd.dst_rank].get();
     if (!ctx || !ctx->cxi_transport ||
         ctx->cxi_peer_addr == FI_ADDR_UNSPEC || ctx->cxi_remote_key == 0) {
-      fprintf(stderr, "Destination CXI ctx missing fields for dst=%u\n",
-              cmd.dst_rank);
+      fprintf(stderr,
+              "Destination CXI ctx missing fields: src=%d dst=%u "
+              "ctx=%p transport=%p peer_addr=%llu "
+              "remote_key=%llu remote_len=%llu\n",
+              my_rank, cmd.dst_rank, static_cast<void*>(ctx),
+              ctx ? static_cast<void*>(ctx->cxi_transport.get()) : nullptr,
+              ctx ? static_cast<unsigned long long>(ctx->cxi_peer_addr) : 0ULL,
+              ctx ? static_cast<unsigned long long>(ctx->cxi_remote_key) : 0ULL,
+              ctx ? static_cast<unsigned long long>(ctx->cxi_remote_len) : 0ULL);
       std::abort();
     }
     uint64_t const remote_offset =
@@ -1624,7 +1631,7 @@ static void post_rdma_async_batched_cxi(
                               pending_by_transport);
 
   for (auto& [transport, pending] : pending_by_transport) {
-    transport->wait_all(pending);
+    if (!transport->wait_all(pending, progress_run)) return;
   }
 }
 #endif
@@ -2330,7 +2337,7 @@ void post_rdma_async_batched(ProxyCtx& S, void* buf, size_t num_wrs,
   (void)num_wrs;
   (void)thread_idx;
   post_rdma_async_batched_cxi(wrs_to_post, cmds_to_post, ctxs, my_rank,
-                              use_normal_mode);
+                              use_normal_mode, &S.progress_run);
   return;
 #endif
   if (use_normal_mode) {
@@ -3716,7 +3723,6 @@ void post_atomic_operations(ProxyCtx& S,
                             std::unordered_set<uint64_t>& acked_wrs,
                             bool use_normal_mode) {
 #ifdef USE_CXI
-  (void)S;
   (void)thread_idx;
   (void)use_normal_mode;
   if (wrs_to_post.size() != cmds_to_post.size()) {
@@ -3725,6 +3731,7 @@ void post_atomic_operations(ProxyCtx& S,
     std::abort();
   }
   for (size_t i = 0; i < cmds_to_post.size(); ++i) {
+    if (!S.progress_run.load(std::memory_order_acquire)) return;
     auto const& cmd = cmds_to_post[i];
     if (cmd.dst_rank == static_cast<uint32_t>(my_rank)) {
       fprintf(stderr, "Posting CXI atomic to itself\n");

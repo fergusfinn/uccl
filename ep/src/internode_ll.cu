@@ -506,48 +506,52 @@ LOW_LATENCY_DISPATCH_RECV:
     EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 15);
 #endif
     if (sub_warp_id == 1 and lane_id == 0) {
+      bool const recv_via_local_or_ipc =
+          src_rank == rank ||
+          ((src_rank / max_nvl_peers == rank / max_nvl_peers) &&
+           ipc_rdma_base_ptrs != nullptr &&
+           ipc_rdma_base_ptrs[rank % max_nvl_peers] != nullptr &&
+           ipc_rdma_base_ptrs[src_rank % max_nvl_peers] != nullptr);
       auto start_time = clock64();
-      while ((src_rank / max_nvl_peers == rank / max_nvl_peers) &&
+      while (recv_via_local_or_ipc &&
              (num_recv_tokens_ipc = ld_acquire_sys_global<kUseAggressiveAtomic>(
                   rdma_recv_count + local_expert_idx * num_ranks + src_rank)) ==
-                 0)
+                 0) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         __builtin_amdgcn_s_sleep(1);
-#else
-        ;
 #endif
+      }
 
-      while ((src_rank / max_nvl_peers != rank / max_nvl_peers) &&
+      while (!recv_via_local_or_ipc &&
              (num_recv_tokens_internode =
                   static_cast<int>(ld_acquire_sys_global<kUseAggressiveAtomic>(
                       reinterpret_cast<uint64_t const*>(
                           rdma_recv_count_internode +
-                          local_expert_idx * num_ranks + src_rank)))) == 0)
+                          local_expert_idx * num_ranks + src_rank)))) == 0) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         __builtin_amdgcn_s_sleep(1);
-#else
-        ;
 #endif
+      }
 
-      if (src_rank / max_nvl_peers == rank / max_nvl_peers) {
+      if (recv_via_local_or_ipc) {
         if (ld_acquire_sys_global<kUseAggressiveAtomic>(
                 reinterpret_cast<uint64_t const*>(rdma_recv_count_internode +
                                                   local_expert_idx * num_ranks +
                                                   src_rank)) != 0) {
           printf(
-              "Same node but rdma_recv_count_internode is not zero! src_rank: "
-              "%d, rank: %d, max_nvl_peers: %d\n",
+              "Local/IPC receive but rdma_recv_count_internode is not zero! "
+              "src_rank: %d, rank: %d, max_nvl_peers: %d\n",
               src_rank, rank, max_nvl_peers);
           EP_DEVICE_ASSERT(false);
         }
       }
-      if (src_rank / max_nvl_peers != rank / max_nvl_peers) {
+      if (!recv_via_local_or_ipc) {
         if (ld_acquire_sys_global<kUseAggressiveAtomic>(
                 rdma_recv_count + local_expert_idx * num_ranks + src_rank) !=
             0) {
           printf(
-              "Different node but rdma_recv_count is not zero! src_rank: %d, "
-              "rank: %d, max_nvl_peers: %d\n",
+              "Internode receive but rdma_recv_count is not zero! src_rank: "
+              "%d, rank: %d, max_nvl_peers: %d\n",
               src_rank, rank, max_nvl_peers);
           EP_DEVICE_ASSERT(false);
         }
@@ -1091,43 +1095,47 @@ LOW_LATENCY_COMBINE_RECV:
     EP_DEVICE_ASSERT(num_warps_per_group > 1);
     if (sub_warp_id == 0 and lane_id == 0) {
       auto const src_rank = responsible_expert_idx / num_local_experts;
+      bool const recv_via_local_or_ipc =
+          src_rank == rank ||
+          ((src_rank / max_nvl_peers == rank / max_nvl_peers) &&
+           ipc_rdma_base_ptrs != nullptr &&
+           ipc_rdma_base_ptrs[rank % max_nvl_peers] != nullptr &&
+           ipc_rdma_base_ptrs[src_rank % max_nvl_peers] != nullptr);
       auto start_time = clock64();
-      while ((src_rank / max_nvl_peers == rank / max_nvl_peers) &&
+      while (recv_via_local_or_ipc &&
              ld_acquire_sys_global<kUseAggressiveAtomic>(
-                 rdma_recv_flag + responsible_expert_idx) == 0)
+                 rdma_recv_flag + responsible_expert_idx) == 0) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         __builtin_amdgcn_s_sleep(1);
-#else
-        ;
 #endif
+      }
 
-      while ((src_rank / max_nvl_peers != rank / max_nvl_peers) &&
+      while (!recv_via_local_or_ipc &&
              ld_acquire_sys_global<kUseAggressiveAtomic>(
                  reinterpret_cast<uint64_t const*>(
-                     rdma_recv_flag_internode + responsible_expert_idx)) == 0)
+                     rdma_recv_flag_internode + responsible_expert_idx)) == 0) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         __builtin_amdgcn_s_sleep(1);
-#else
-        ;
 #endif
+      }
 
-      if (src_rank / max_nvl_peers == rank / max_nvl_peers) {
+      if (recv_via_local_or_ipc) {
         if (ld_acquire_sys_global<kUseAggressiveAtomic>(
                 reinterpret_cast<uint64_t const*>(
                     rdma_recv_flag_internode + responsible_expert_idx)) != 0) {
           printf(
-              "Same node but rdma_recv_flag_internode is not zero! src_rank: "
-              "%d, rank: %d, max_nvl_peers: %d\n",
+              "Local/IPC receive but rdma_recv_flag_internode is not zero! "
+              "src_rank: %d, rank: %d, max_nvl_peers: %d\n",
               src_rank, rank, max_nvl_peers);
           EP_DEVICE_ASSERT(false);
         }
       }
-      if (src_rank / max_nvl_peers != rank / max_nvl_peers) {
+      if (!recv_via_local_or_ipc) {
         if (ld_acquire_sys_global<kUseAggressiveAtomic>(
                 rdma_recv_flag + responsible_expert_idx) != 0) {
           printf(
-              "Different node but rdma_recv_flag is not zero! src_rank: %d, "
-              "rank: %d, max_nvl_peers: %d\n",
+              "Internode receive but rdma_recv_flag is not zero! src_rank: "
+              "%d, rank: %d, max_nvl_peers: %d\n",
               src_rank, rank, max_nvl_peers);
           EP_DEVICE_ASSERT(false);
         }

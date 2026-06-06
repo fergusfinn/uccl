@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <vector>
 
 #include <cuda_runtime_api.h>
@@ -42,7 +43,8 @@ class Transport {
   void inject_atomic_add64(fi_addr_t peer, int64_t value,
                            uint64_t remote_offset, uint64_t remote_key);
   void wait(WriteContext* ctx);
-  void wait_all(std::vector<WriteContext*> const& ctxs);
+  bool wait_all(std::vector<WriteContext*> const& ctxs,
+                std::atomic<bool> const* progress_run = nullptr);
 
  private:
   fi_info* info_ = nullptr;

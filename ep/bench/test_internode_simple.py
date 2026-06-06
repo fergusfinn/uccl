@@ -22,9 +22,6 @@ import sys
 from utils import (
     init_dist,
     detect_ib_hca,
-    get_cpu_proxies_meta,
-    initialize_uccl,
-    destroy_uccl,
 )
 
 
@@ -49,16 +46,12 @@ def test_simple_internode(rank: int, num_ranks: int, group: dist.ProcessGroup):
         device_index
     ).multi_processor_count
 
-    scratch_nbytes = int(1e9)  # 256 MB
-    scratch = torch.empty(
-        scratch_nbytes, dtype=torch.uint8, device=f"cuda:{device_index}"
-    )
-    proxies, workers = initialize_uccl(scratch, scratch_nbytes, rank, num_ranks, group)
+    scratch_nbytes = int(1e9)
+    buffer = None
 
     try:
         buffer = Buffer(
             group=group,
-            rdma_buffer_ptr=scratch.data_ptr(),
             num_nvl_bytes=0,
             num_rdma_bytes=int(scratch_nbytes),
             low_latency_mode=True,
@@ -70,20 +63,6 @@ def test_simple_internode(rank: int, num_ranks: int, group: dist.ProcessGroup):
 
         if rank == 0:
             print("[simple-test] ✓ Buffer created successfully", flush=True)
-
-        buffer.connect_atomic_buffer(proxies[0])
-
-        for proxy in proxies:
-            proxy.calculate_and_set_dispatch_recv_data_offset(
-                num_tokens, hidden, num_experts
-            )
-            proxy.set_atomic_buffer_ptr(proxies[0].get_atomic_buffer_ptr())
-
-        if rank == 0:
-            print(
-                "[simple-test] ✓ dispatch_recv_data_offset calculated and set by CPU proxy",
-                flush=True,
-            )
 
         cumulative_local_expert_recv_stats = torch.zeros(
             (num_experts // num_ranks,), dtype=torch.int, device="cuda"
@@ -129,7 +108,6 @@ def test_simple_internode(rank: int, num_ranks: int, group: dist.ProcessGroup):
 
         time.sleep(1)
         print("[simple-test] ✓ before destroy!", flush=True)
-
     except Exception as e:
         if rank == 0:
             import traceback
@@ -138,16 +116,14 @@ def test_simple_internode(rank: int, num_ranks: int, group: dist.ProcessGroup):
             traceback.print_exc()
         raise
 
-    try:
-        buffer.destroy()
-    except Exception:
-        pass
-
     dist.barrier()
+    if buffer is not None:
+        try:
+            buffer.destroy()
+        except Exception:
+            pass
+
     print("[simple-test] ✓ Buffer destroyed", flush=True)
-
-    destroy_uccl(proxies, workers)
-    dist.barrier()
 
 
 def test_worker(local_rank: int, num_local_ranks: int):
@@ -156,7 +132,6 @@ def test_worker(local_rank: int, num_local_ranks: int):
     try:
         test_simple_internode(rank, num_ranks, group)
     finally:
-        dist.barrier()
         dist.destroy_process_group()
 
 

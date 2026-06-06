@@ -143,11 +143,10 @@ void UcclProxy::stop() {
     throw std::runtime_error("Proxy already stopped");
   }
   proxy_->set_progress_run(false);
+  proxy_->notify_proxy_thread_adaptive_sleeper();
   if (thread_.joinable()) thread_.join();
   running_.store(false, std::memory_order_release);
-  // Because proxies share the gpu_buffer, only destroy gpu_buffer for the first
-  // proxy.
-  proxy_->destroy(thread_idx_ == 0);
+  proxy_->destroy(false);
 }
 
 void UcclProxy::start(Mode m) {

@@ -270,9 +270,10 @@ void Transport::wait(WriteContext* ctx) {
   }
 }
 
-void Transport::wait_all(std::vector<WriteContext*> const& ctxs) {
+bool Transport::wait_all(std::vector<WriteContext*> const& ctxs,
+                         std::atomic<bool> const* progress_run) {
   if (!cq_) throw std::runtime_error("CXI CQ missing");
-  if (ctxs.empty()) return;
+  if (ctxs.empty()) return true;
 
   std::unordered_set<void*> pending;
   pending.reserve(ctxs.size());
@@ -295,6 +296,10 @@ void Transport::wait_all(std::vector<WriteContext*> const& ctxs) {
       continue;
     }
     if (rc == -FI_EAGAIN) {
+      if (progress_run &&
+          !progress_run->load(std::memory_order_acquire)) {
+        return false;
+      }
       if ((++spins & 0x3ff) == 0) sched_yield();
       continue;
     }
@@ -309,6 +314,7 @@ void Transport::wait_all(std::vector<WriteContext*> const& ctxs) {
     }
     check_fi("fi_cq_read", static_cast<int>(rc));
   }
+  return true;
 }
 
 }  // namespace uccl::cxi

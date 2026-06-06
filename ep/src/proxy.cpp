@@ -93,6 +93,17 @@ static int normal_mode_rank_stride(int num_ranks, int num_nodes) {
   return MAX_NUM_GPUS;
 }
 
+static bool skip_network_peer_on_same_ip(bool same_ip, bool use_normal_mode) {
+#ifdef USE_CXI
+  // Low-latency CXI may use host-pinned RDMA buffers, so CUDA IPC can be
+  // unavailable even for same-node peers. Keep those peer contexts connected.
+  return same_ip && use_normal_mode;
+#else
+  (void)use_normal_mode;
+  return same_ip;
+#endif
+}
+
 #ifdef USE_CXI
 static constexpr size_t kCxiBarrierBytes = 4096;
 
@@ -364,8 +375,9 @@ void Proxy::init_common() {
     c.atomic_old_values_mr = ctx_.atomic_old_values_mr;
 
     if (peer == my_rank) continue;
-    // Skip rdma connection for intra-node.
-    if (peers_[peer].ip == peers_[my_rank].ip) continue;
+    if (skip_network_peer_on_same_ip(peers_[peer].ip == peers_[my_rank].ip,
+                                     cfg_.use_normal_mode))
+      continue;
     if (cfg_.use_normal_mode &&
         std::abs(peer - my_rank) % normal_rank_stride != 0)
       continue;
@@ -400,8 +412,9 @@ void Proxy::init_common() {
   // Out-of-band exchange info per pair: start receiver thread first
   std::thread receiver_thread([this, num_ranks, my_rank, normal_rank_stride]() {
     for (int peer = 0; peer < num_ranks; ++peer) {
-      // Skip rdma connection for intra-node.
-      if (peer == my_rank || peers_[peer].ip == peers_[my_rank].ip ||
+      if (peer == my_rank ||
+          skip_network_peer_on_same_ip(peers_[peer].ip == peers_[my_rank].ip,
+                                       cfg_.use_normal_mode) ||
           (cfg_.use_normal_mode &&
            std::abs(peer - my_rank) % normal_rank_stride != 0))
         continue;
@@ -413,7 +426,9 @@ void Proxy::init_common() {
 
   // Then send our info to all peers
   for (int peer = 0; peer < num_ranks; ++peer) {
-    if (peer == my_rank || peers_[peer].ip == peers_[my_rank].ip ||
+    if (peer == my_rank ||
+        skip_network_peer_on_same_ip(peers_[peer].ip == peers_[my_rank].ip,
+                                     cfg_.use_normal_mode) ||
         (cfg_.use_normal_mode &&
          std::abs(peer - my_rank) % normal_rank_stride != 0))
       continue;
@@ -428,7 +443,9 @@ void Proxy::init_common() {
 
   // Verify remote info correctness
   for (int peer = 0; peer < num_ranks; ++peer) {
-    if (peer == my_rank || peers_[peer].ip == peers_[my_rank].ip ||
+    if (peer == my_rank ||
+        skip_network_peer_on_same_ip(peers_[peer].ip == peers_[my_rank].ip,
+                                     cfg_.use_normal_mode) ||
         (cfg_.use_normal_mode &&
          std::abs(peer - my_rank) % normal_rank_stride != 0))
       continue;
@@ -447,8 +464,9 @@ void Proxy::init_common() {
   // Bring each per-peer QP to RTR/RTS
   for (int peer = 0; peer < num_ranks; ++peer) {
     if (peer == my_rank) continue;
-    // Skip rdma connection for intra-node.
-    if (peers_[peer].ip == peers_[my_rank].ip) continue;
+    if (skip_network_peer_on_same_ip(peers_[peer].ip == peers_[my_rank].ip,
+                                     cfg_.use_normal_mode))
+      continue;
     if (cfg_.use_normal_mode &&
         std::abs(peer - my_rank) % normal_rank_stride != 0)
       continue;
@@ -638,7 +656,9 @@ void Proxy::run_dual() {
       static_cast<int>(ctxs_for_all_ranks_.size()), cfg_.num_nodes);
   for (int peer = 0; peer < (int)ctxs_for_all_ranks_.size(); ++peer) {
     if (peer == cfg_.rank) continue;
-    if (peers_[peer].ip == peers_[cfg_.rank].ip) continue;
+    if (skip_network_peer_on_same_ip(peers_[peer].ip == peers_[cfg_.rank].ip,
+                                     cfg_.use_normal_mode))
+      continue;
     if (cfg_.use_normal_mode &&
         std::abs(peer - cfg_.rank) % normal_rank_stride != 0)
       continue;
@@ -758,6 +778,7 @@ void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
   // Multi-ring buffer processing: collect commands from all ring buffers
   // Process each ring buffer (similar to test_multi_ring_throughput.cu)
   for (size_t rb_idx = 0; rb_idx < cfg_.d2h_queues.size(); rb_idx++) {
+    if (!ctx_.progress_run.load(std::memory_order_acquire)) return;
     d2hq::HostD2HHandle* h = &cfg_.d2h_queues[rb_idx];
 #ifdef USE_MSCCLPP_FIFO_BACKEND
     assert(h && "h is empty!\n");
@@ -845,6 +866,7 @@ void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
 
     // Collect batch of commands from this ring buffer
     for (size_t i = ring_seen; i < cur_head; ++i) {
+      if (!ctx_.progress_run.load(std::memory_order_acquire)) return;
       CmdType cmd = h->volatile_load_cmd_type(i);
       // NOTE(MaoZiming): Non-blocking. prevent local and remote both while
       // loop.
@@ -864,7 +886,9 @@ void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
           cudaDeviceSynchronize();
           std::abort();
         }
-        if (peers_[cmd_entry.dst_rank].ip == peers_[cfg_.rank].ip) {
+        if (skip_network_peer_on_same_ip(
+                peers_[cmd_entry.dst_rank].ip == peers_[cfg_.rank].ip,
+                cfg_.use_normal_mode)) {
           fprintf(
               stderr,
               "[ERROR] Intra-node command!, cmd.dst_rank: %d, cfg_.rank: %d, "
@@ -891,6 +915,7 @@ void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
 
   // Process all collected commands in batch
   if (!wrs_to_post.empty()) {
+    if (!ctx_.progress_run.load(std::memory_order_acquire)) return;
 #ifdef MEASURE_PER_OP_LATENCY
     auto start = std::chrono::high_resolution_clock::now();
 #endif
