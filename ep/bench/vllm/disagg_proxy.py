@@ -18,10 +18,12 @@ Client sends requests to this proxy (port 9000). The proxy:
 import argparse
 import json
 import sys
+import uuid
+from urllib.parse import urlparse
 
 import aiohttp
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 import uvicorn
 
 app = FastAPI()
@@ -34,6 +36,17 @@ VERBOSE = False
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+
+    def request_headers() -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "X-Request-Id": request_id,
+        }
+        auth = request.headers.get("Authorization")
+        if auth:
+            headers["Authorization"] = auth
+        return headers
 
     # Step 1: Send to prefill with max_tokens=1 to populate KV cache.
     # do_remote_decode=True tells prefill's NixlConnector that a remote
@@ -42,16 +55,25 @@ async def chat_completions(request: Request):
     # block IDs, engine ID, and side channel address for the decode node.
     prefill_body = dict(body)
     prefill_body["max_tokens"] = 1
+    if "max_completion_tokens" in prefill_body:
+        prefill_body["max_completion_tokens"] = 1
     prefill_body["stream"] = False
     prefill_body.pop("stream_options", None)
-    prefill_body["kv_transfer_params"] = {"do_remote_decode": True}
+    prefill_body["kv_transfer_params"] = {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "remote_block_ids": None,
+        "remote_host": None,
+        "remote_port": None,
+    }
 
     async with aiohttp.ClientSession() as session:
         # Prefill request
         async with session.post(
             f"{PREFILL_URL}/v1/chat/completions",
             json=prefill_body,
-            headers={"Content-Type": "application/json"},
+            headers=request_headers(),
         ) as prefill_resp:
             if prefill_resp.status != 200:
                 error = await prefill_resp.text()
@@ -87,6 +109,9 @@ async def chat_completions(request: Request):
         # Step 3: Forward to decode with kv_transfer_params
         decode_body = dict(body)
         if kv_transfer_params:
+            kv_transfer_params = dict(kv_transfer_params)
+            if not kv_transfer_params.get("remote_host"):
+                kv_transfer_params["remote_host"] = urlparse(PREFILL_URL).hostname
             decode_body["kv_transfer_params"] = kv_transfer_params
 
         is_stream = body.get("stream", False)
@@ -98,7 +123,7 @@ async def chat_completions(request: Request):
                     async with s.post(
                         f"{DECODE_URL}/v1/chat/completions",
                         json=decode_body,
-                        headers={"Content-Type": "application/json"},
+                        headers=request_headers(),
                     ) as resp:
                         async for chunk in resp.content.iter_any():
                             yield chunk
@@ -108,9 +133,20 @@ async def chat_completions(request: Request):
             async with session.post(
                 f"{DECODE_URL}/v1/chat/completions",
                 json=decode_body,
-                headers={"Content-Type": "application/json"},
+                headers=request_headers(),
             ) as decode_resp:
-                return await decode_resp.json()
+                body_bytes = await decode_resp.read()
+                content_type = decode_resp.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    return JSONResponse(
+                        content=json.loads(body_bytes),
+                        status_code=decode_resp.status,
+                    )
+                return Response(
+                    content=body_bytes,
+                    status_code=decode_resp.status,
+                    media_type=content_type or None,
+                )
 
 
 @app.get("/health")
