@@ -581,7 +581,9 @@ def test_loop(
     if args.test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
-    if torch.version.cuda:
+    if args.num_sms is not None:
+        num_sms = args.num_sms
+    elif torch.version.cuda:
         num_sms = 24
     elif torch.version.hip:
         num_sms = 64 if num_nodes < 4 else 32
@@ -698,6 +700,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num-experts", type=int, default=256, help="Number of experts (default: 256"
+    )
+    parser.add_argument(
+        "--num-sms",
+        type=int,
+        default=None,
+        help="Override the number of SMs used by high-throughput kernels",
     )
     parser.add_argument(
         "--test-ll-compatibility",
