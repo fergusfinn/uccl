@@ -76,11 +76,18 @@ async def chat_completions(request: Request):
             headers=request_headers(),
         ) as prefill_resp:
             if prefill_resp.status != 200:
-                error = await prefill_resp.text()
+                error = await prefill_resp.read()
+                content_type = prefill_resp.headers.get("content-type", "")
                 print(
-                    f"[ERROR] Prefill {prefill_resp.status}: {error}", file=sys.stderr
+                    f"[ERROR] Prefill {prefill_resp.status}: "
+                    f"{error.decode(errors='replace')}",
+                    file=sys.stderr,
                 )
-                return {"error": f"Prefill failed: {error}"}
+                return Response(
+                    content=error,
+                    status_code=prefill_resp.status,
+                    media_type=content_type or None,
+                )
             prefill_result = await prefill_resp.json()
 
         # Step 2: Extract kv_transfer_params from prefill response.
@@ -117,18 +124,39 @@ async def chat_completions(request: Request):
         is_stream = body.get("stream", False)
 
         if is_stream:
+            decode_session = aiohttp.ClientSession()
+            decode_resp = await decode_session.post(
+                f"{DECODE_URL}/v1/chat/completions",
+                json=decode_body,
+                headers=request_headers(),
+            )
+
+            if decode_resp.status != 200:
+                body_bytes = await decode_resp.read()
+                content_type = decode_resp.headers.get("content-type", "")
+                decode_resp.release()
+                await decode_session.close()
+                if "application/json" in content_type:
+                    return JSONResponse(
+                        content=json.loads(body_bytes),
+                        status_code=decode_resp.status,
+                    )
+                return Response(
+                    content=body_bytes,
+                    status_code=decode_resp.status,
+                    media_type=content_type or None,
+                )
 
             async def stream_decode():
-                async with aiohttp.ClientSession() as s:
-                    async with s.post(
-                        f"{DECODE_URL}/v1/chat/completions",
-                        json=decode_body,
-                        headers=request_headers(),
-                    ) as resp:
-                        async for chunk in resp.content.iter_any():
-                            yield chunk
+                try:
+                    async for chunk in decode_resp.content.iter_any():
+                        yield chunk
+                finally:
+                    decode_resp.release()
+                    await decode_session.close()
 
-            return StreamingResponse(stream_decode(), media_type="text/event-stream")
+            media_type = decode_resp.headers.get("content-type") or "text/event-stream"
+            return StreamingResponse(stream_decode(), media_type=media_type)
         else:
             async with session.post(
                 f"{DECODE_URL}/v1/chat/completions",
