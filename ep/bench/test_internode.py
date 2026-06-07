@@ -91,6 +91,14 @@ def test_main(
 ):
     # Settings
     num_tokens, hidden = args.num_tokens, args.hidden
+    if args.rank_num_tokens:
+        rank_num_tokens = [int(value) for value in args.rank_num_tokens.split(",")]
+        if len(rank_num_tokens) != num_ranks:
+            raise ValueError(
+                f"--rank-num-tokens has {len(rank_num_tokens)} entries, "
+                f"but world size is {num_ranks}"
+            )
+        num_tokens = rank_num_tokens[rank]
     num_topk_groups, num_topk, num_experts = (
         args.num_topk_groups,
         args.num_topk,
@@ -103,6 +111,8 @@ def test_main(
             f"[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}",
             flush=True,
         )
+        if args.rank_num_tokens:
+            print(f"[config] rank_num_tokens={rank_num_tokens}", flush=True)
 
     # Random data
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * rank
@@ -193,7 +203,16 @@ def test_main(
     rdma_buffer_size, nvl_buffer_size = 512, (720 if num_ranks in (144, 160) else 512)
     if num_ranks == 24:
         nvl_buffer_size = 540
-    config = Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
+    dispatch_config = (
+        Buffer.get_dispatch_config(num_ranks)
+        if args.use_default_configs
+        else Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
+    )
+    combine_config = (
+        Buffer.get_combine_config(num_ranks)
+        if args.use_default_configs
+        else dispatch_config
+    )
 
     # Test dispatch
     # noinspection PyShadowingNames
@@ -220,7 +239,7 @@ def test_main(
                         "num_tokens_per_rdma_rank": num_tokens_per_rdma_rank,
                         "is_token_in_rank": is_token_in_rank,
                         "num_tokens_per_expert": num_tokens_per_expert,
-                        "config": config,
+                        "config": dispatch_config,
                         "async_finish": async_mode,
                     }
                     if with_topk:
@@ -293,7 +312,7 @@ def test_main(
                             check_data(recv_topk_weights, recv_gbl_rank_prefix_sum)
 
                     # Test `num_worst_tokens != 0`
-                    if with_topk:
+                    if with_topk and not args.skip_worst_tokens:
                         num_worst_tokens = num_tokens * num_ranks
                         dispatch_args.update({"num_worst_tokens": num_worst_tokens})
                         (
@@ -331,7 +350,7 @@ def test_main(
                         dispatch_args = {
                             "x": current_x,
                             "handle": handle,
-                            "config": config,
+                            "config": dispatch_config,
                             "async_finish": async_mode,
                         }
                         if previous_mode:
@@ -357,7 +376,7 @@ def test_main(
                         "x": recv_x,
                         "bias": (bias_0, bias_1),
                         "handle": handle,
-                        "config": config,
+                        "config": combine_config,
                         "async_finish": async_mode,
                     }
                     if with_topk:
@@ -681,6 +700,15 @@ if __name__ == "__main__":
         "--num-tokens", type=int, default=4096, help="Number of tokens (default: 4096)"
     )
     parser.add_argument(
+        "--rank-num-tokens",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated token counts by global rank. Overrides "
+            "--num-tokens for skewed per-rank dispatch tests."
+        ),
+    )
+    parser.add_argument(
         "--hidden", type=int, default=7168, help="Hidden dimension size (default: 7168)"
     )
     parser.add_argument(
@@ -716,6 +744,16 @@ if __name__ == "__main__":
         "--smoke-one",
         action="store_true",
         help="run only the first dispatch/combine correctness variant",
+    )
+    parser.add_argument(
+        "--skip-worst-tokens",
+        action="store_true",
+        help="skip the num_worst_tokens stress subcase",
+    )
+    parser.add_argument(
+        "--use-default-configs",
+        action="store_true",
+        help="use Buffer.get_dispatch_config/get_combine_config for correctness",
     )
     parser.add_argument(
         "--fixed-dispatch-nvl-chunk",
