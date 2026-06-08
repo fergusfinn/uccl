@@ -5,9 +5,11 @@
 #include "ring_buffer.cuh"
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 
 UcclProxy::UcclProxy(int thread_idx, uintptr_t gpu_buffer_addr,
@@ -58,34 +60,71 @@ UcclProxy::UcclProxy(int thread_idx, uintptr_t gpu_buffer_addr,
 
   if (thread_idx == 0) {
 #ifdef USE_CXI
-    cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize, cudaHostAllocMapped);
+    auto err = cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize,
+                             cudaHostAllocMapped);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaHostAlloc atomic buffer failed: ") +
+                               cudaGetErrorString(err));
+    }
     atomic_buffer_is_host_allocated_ = true;
 #elif defined(USE_GRACE_HOPPER)
-    cudaMallocManaged(&atomic_buffer_ptr_, kAtomicBufferSize);
+    auto err = cudaMallocManaged(&atomic_buffer_ptr_, kAtomicBufferSize);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("cudaMallocManaged atomic buffer failed: ") +
+          cudaGetErrorString(err));
+    }
     atomic_buffer_is_host_allocated_ = false;
 #elif defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    hipExtMallocWithFlags(&atomic_buffer_ptr_, kAtomicBufferSize,
-                          hipDeviceMallocUncached);
+    auto err = hipExtMallocWithFlags(&atomic_buffer_ptr_, kAtomicBufferSize,
+                                     hipDeviceMallocUncached);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("hipExtMallocWithFlags atomic buffer failed: ") +
+          cudaGetErrorString(err));
+    }
     atomic_buffer_is_host_allocated_ = false;
 #elif defined(EFA)
     // EFA: atomic buffer is always pinned host memory (cudaHostAlloc).
-    cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize,
-                  cudaHostAllocMapped | cudaHostAllocWriteCombined);
+    auto err = cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize,
+                             cudaHostAllocMapped | cudaHostAllocWriteCombined);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaHostAlloc atomic buffer failed: ") +
+                               cudaGetErrorString(err));
+    }
     atomic_buffer_is_host_allocated_ = true;
 #else
     // Dynamically detect: on some nodes (e.g. GH10) ibv_reg_mr fails for
     // cudaMalloc; use pinned host memory then. Override with
     // UCCL_ATOMICS_USE_HOST_MEMORY=1 to force host memory.
     if (can_register_gpu_memory_for_atomics(local_rank)) {
-      cudaMalloc(&atomic_buffer_ptr_, kAtomicBufferSize);
+      auto err = cudaMalloc(&atomic_buffer_ptr_, kAtomicBufferSize);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("cudaMalloc atomic buffer failed: ") +
+            cudaGetErrorString(err));
+      }
       atomic_buffer_is_host_allocated_ = false;
     } else {
-      cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize,
-                    cudaHostAllocMapped);
+      auto err = cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize,
+                               cudaHostAllocMapped);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("cudaHostAlloc atomic buffer failed: ") +
+            cudaGetErrorString(err));
+      }
       atomic_buffer_is_host_allocated_ = true;
     }
 #endif
-    cudaMemset(atomic_buffer_ptr_, 0, kAtomicBufferSize);
+    if (atomic_buffer_is_host_allocated_) {
+      std::memset(atomic_buffer_ptr_, 0, kAtomicBufferSize);
+    } else {
+      auto err = cudaMemset(atomic_buffer_ptr_, 0, kAtomicBufferSize);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemset atomic buffer failed: ") +
+                                 cudaGetErrorString(err));
+      }
+    }
     proxy_->set_atomic_buffer_ptr(atomic_buffer_ptr_);
   }
 }
