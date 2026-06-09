@@ -543,7 +543,7 @@ class Buffer {
       if (num_tokens_per_rdma_rank_ptr != 0) {
         CUDA_CHECK(cudaMemsetAsync(
             reinterpret_cast<void*>(num_tokens_per_rdma_rank_ptr), 0,
-            num_ranks * sizeof(int), comm_stream));
+            num_rdma_ranks * sizeof(int), comm_stream));
       }
       CUDA_CHECK(
           cudaMemsetAsync(reinterpret_cast<void*>(num_tokens_per_expert_ptr), 0,
