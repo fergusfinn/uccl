@@ -687,6 +687,14 @@ void Proxy::run_dual() {
                  atomic_buffer_ptr_, cfg_.num_ranks, cfg_.num_experts,
                  pending_atomic_updates, cfg_.rank, cfg_.num_nodes,
                  adaptive_sleeper_, cfg_.use_normal_mode);
+#ifdef USE_CXI
+    if (cxi_fast_mode()) {
+      for (auto& c : ctxs_for_all_ranks_) {
+        if (c && c->cxi_transport && c->cxi_transport->outstanding() > 0)
+          cxi_retire_ctx(*c, acked_wrs_, 64);
+      }
+    }
+#endif
     notify_gpu_completion(my_tail);
     post_gpu_command(my_tail, seen);
 #ifdef USE_RECEIVER_BARRIER
@@ -712,6 +720,22 @@ void Proxy::run_dual() {
       barrier_check();
     }
   }
+
+#ifdef USE_CXI
+  // Best-effort drain so transports are not torn down with writes in
+  // flight; bounded so shutdown cannot hang on a dead peer.
+  if (cxi_fast_mode()) {
+    auto const deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    for (auto& c : ctxs_for_all_ranks_) {
+      if (!c || !c->cxi_transport) continue;
+      while (c->cxi_transport->outstanding() > 0 &&
+             std::chrono::steady_clock::now() < deadline) {
+        cxi_retire_ctx(*c, acked_wrs_, 64);
+      }
+    }
+  }
+#endif
 }
 
 void Proxy::notify_gpu_completion(uint64_t& my_tail) {
@@ -1135,10 +1159,7 @@ void Proxy::post_gpu_commands_mixed(
   if (!rdma_wrs.empty()) {
     post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
                             rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
-                            cfg_.thread_idx, cfg_.use_normal_mode);
-#ifdef USE_CXI
-    for (uint64_t wr_id : rdma_wrs) acked_wrs_.insert(wr_id);
-#endif
+                            cfg_.thread_idx, cfg_.use_normal_mode, acked_wrs_);
     rdma_wrs.clear();
     rdma_cmds.clear();
   }
@@ -1174,6 +1195,19 @@ void Proxy::post_gpu_commands_mixed(
 
 void Proxy::quiet_cq() {
 #ifdef USE_CXI
+  if (cxi_fast_mode()) {
+    // Drain all outstanding async writes so quiet means "on the wire and
+    // locally complete", matching the verbs path's semantics.
+    for (auto& c : ctxs_for_all_ranks_) {
+      if (!c || !c->cxi_transport) continue;
+      while (c->cxi_transport->outstanding() > 0) {
+        if (cxi_retire_ctx(*c, acked_wrs_, 64) == 0) {
+          if (!ctx_.progress_run.load(std::memory_order_acquire)) return;
+          cpu_relax();
+        }
+      }
+    }
+  }
   return;
 #endif
   auto outstanding_batches = [&]() -> size_t { return 0; };
@@ -1431,9 +1465,17 @@ void Proxy::post_barrier_msg(int dst_rank, bool ack, uint64_t seq) {
   int const stride = normal_mode_rank_stride(cfg_.num_ranks, cfg_.num_nodes);
   int const dst_node_idx = stride > 0 ? dst_rank / stride : 0;
   int const slot = ack ? cfg_.num_nodes + dst_node_idx : cfg_.node_idx;
-  ctx->cxi_transport->inject_atomic_add64(ctx->cxi_peer_addr, 1,
-                                          cxi_barrier_slot_offset(slot),
-                                          ctx->cxi_remote_host_key);
+  if (cxi_fast_mode()) {
+    while (ctx->cxi_transport->try_inject_atomic_add64(
+               ctx->cxi_peer_addr, 1, cxi_barrier_slot_offset(slot),
+               ctx->cxi_remote_host_key) == -FI_EAGAIN) {
+      if (cxi_retire_ctx(*ctx, acked_wrs_, 64) == 0) cpu_relax();
+    }
+  } else {
+    ctx->cxi_transport->inject_atomic_add64(ctx->cxi_peer_addr, 1,
+                                            cxi_barrier_slot_offset(slot),
+                                            ctx->cxi_remote_host_key);
+  }
   return;
 #endif
   if (!ctx || !ctx->qp || !ctx->mr) {

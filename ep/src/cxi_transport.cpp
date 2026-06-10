@@ -86,6 +86,13 @@ void Transport::init(int device_index) {
   try {
     check_fi("fi_getinfo(cxi)", fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr,
                                            0, hints, &info_));
+    {
+      char const* dc = std::getenv("UCCL_CXI_DELIVERY_COMPLETE");
+      if (dc && dc[0] == (char)0x31) {
+        info_->tx_attr->op_flags |= FI_DELIVERY_COMPLETE;
+        fprintf(stderr, "[CXI] FI_DELIVERY_COMPLETE enabled on TX\n");
+      }
+    }
     check_fi("fi_fabric", fi_fabric(info_->fabric_attr, &fabric_, nullptr));
     check_fi("fi_domain", fi_domain(fabric_, info_, &domain_, nullptr));
     check_fi("fi_endpoint", fi_endpoint(domain_, info_, &ep_, nullptr));
@@ -207,9 +214,48 @@ fi_addr_t Transport::insert_peer(EndpointInfo const& peer) {
   return addr;
 }
 
-void Transport::write(fi_addr_t peer, void* local, size_t bytes,
-                      uint64_t remote_offset, uint64_t remote_key,
-                      WriteContext* ctx) {
+namespace {
+[[noreturn]] void throw_cq_error(fid_cq* cq) {
+  fi_cq_err_entry err{};
+  fi_cq_readerr(cq, &err, 0);
+  char buf[256];
+  char const* msg =
+      fi_cq_strerror(cq, err.prov_errno, err.err_data, buf, sizeof(buf));
+  throw std::runtime_error(std::string("CXI CQ error: ") +
+                           (msg ? msg : fi_strerror(err.err)));
+}
+}  // namespace
+
+// Consume up to `max` completions, marking contexts done. Returns number
+// consumed; fills `done` (may be null when the caller doesn't need them).
+size_t Transport::poll(WriteContext** done, size_t max) {
+  if (!cq_) throw std::runtime_error("CXI CQ missing");
+  if (outstanding_ == 0 || max == 0) return 0;
+  size_t n = 0;
+  while (n < max) {
+    fi_cq_entry entries[16]{};
+    size_t const want = std::min<size_t>(16, max - n);
+    ssize_t rc = fi_cq_read(cq_, entries, want);
+    if (rc > 0) {
+      for (ssize_t i = 0; i < rc; ++i) {
+        auto* c = reinterpret_cast<WriteContext*>(entries[i].op_context);
+        c->in_use = false;
+        if (outstanding_ > 0) --outstanding_;
+        if (done) done[n] = c;
+        ++n;
+      }
+      continue;
+    }
+    if (rc == -FI_EAGAIN) break;
+    if (rc == -FI_EAVAIL) throw_cq_error(cq_);
+    check_fi("fi_cq_read", static_cast<int>(rc));
+  }
+  return n;
+}
+
+int Transport::try_write(fi_addr_t peer, void* local, size_t bytes,
+                         uint64_t remote_offset, uint64_t remote_key,
+                         WriteContext* ctx) {
   if (!ep_ || !mr_) throw std::runtime_error("CXI endpoint or MR missing");
   if (!ctx) throw std::runtime_error("CXI write context is null");
   uintptr_t const local_addr = reinterpret_cast<uintptr_t>(local);
@@ -227,46 +273,60 @@ void Transport::write(fi_addr_t peer, void* local, size_t bytes,
 
   // CXI advertises FI_MR_VIRT_ADDR, but the validated CUDA write path on
   // Isambard requires offset-zero RMA addressing with provider keys.
-  check_fi("fi_write(cuda)",
-           fi_write(ep_, local, bytes, fi_mr_desc(local_mr), peer,
-                    remote_offset, remote_key, &ctx->ctx));
+  ssize_t rc = fi_write(ep_, local, bytes, fi_mr_desc(local_mr), peer,
+                        remote_offset, remote_key, &ctx->ctx);
+  if (rc == -FI_EAGAIN) return -FI_EAGAIN;
+  check_fi("fi_write(cuda)", static_cast<int>(rc));
+  ctx->in_use = true;
+  ++outstanding_;
+  return 0;
+}
+
+void Transport::write(fi_addr_t peer, void* local, size_t bytes,
+                      uint64_t remote_offset, uint64_t remote_key,
+                      WriteContext* ctx) {
+  uint32_t spins = 0;
+  for (;;) {
+    int rc = try_write(peer, local, bytes, remote_offset, remote_key, ctx);
+    if (rc == 0) return;
+    // TX queue full: make progress by consuming completions, then retry.
+    // NOTE: completions consumed here are not reported to any caller, so
+    // this blocking variant is only safe on transports whose retirement
+    // bookkeeping happens via wait_all() (the sync path).
+    poll(nullptr, 16);
+    if ((++spins & 0x3ff) == 0) sched_yield();
+  }
+}
+
+int Transport::try_inject_atomic_add64(fi_addr_t peer, int64_t value,
+                                       uint64_t remote_offset,
+                                       uint64_t remote_key) {
+  if (!ep_) throw std::runtime_error("CXI endpoint missing");
+  ssize_t rc = fi_inject_atomic(ep_, &value, 1, peer, remote_offset,
+                                remote_key, FI_INT64, FI_SUM);
+  if (rc == -FI_EAGAIN) return -FI_EAGAIN;
+  check_fi("fi_inject_atomic(add64)", static_cast<int>(rc));
+  return 0;
 }
 
 void Transport::inject_atomic_add64(fi_addr_t peer, int64_t value,
                                     uint64_t remote_offset,
                                     uint64_t remote_key) {
-  if (!ep_) throw std::runtime_error("CXI endpoint missing");
-  check_fi("fi_inject_atomic(add64)",
-           fi_inject_atomic(ep_, &value, 1, peer, remote_offset, remote_key,
-                            FI_INT64, FI_SUM));
+  uint32_t spins = 0;
+  while (try_inject_atomic_add64(peer, value, remote_offset, remote_key) ==
+         -FI_EAGAIN) {
+    poll(nullptr, 16);
+    if ((++spins & 0x3ff) == 0) sched_yield();
+  }
 }
 
 void Transport::wait(WriteContext* ctx) {
   if (!cq_ || !ctx) throw std::runtime_error("CXI CQ or context missing");
   uint32_t spins = 0;
-  for (;;) {
-    fi_cq_entry entry{};
-    ssize_t rc = fi_cq_read(cq_, &entry, 1);
-    if (rc == 1) {
-      if (entry.op_context != &ctx->ctx) {
-        throw std::runtime_error("CXI CQ returned unexpected context");
-      }
-      return;
-    }
-    if (rc == -FI_EAGAIN) {
+  while (ctx->in_use) {
+    if (poll(nullptr, 16) == 0) {
       if ((++spins & 0x3ff) == 0) sched_yield();
-      continue;
     }
-    if (rc == -FI_EAVAIL) {
-      fi_cq_err_entry err{};
-      fi_cq_readerr(cq_, &err, 0);
-      char buf[256];
-      char const* msg =
-          fi_cq_strerror(cq_, err.prov_errno, err.err_data, buf, sizeof(buf));
-      throw std::runtime_error(std::string("CXI CQ error: ") +
-                               (msg ? msg : fi_strerror(err.err)));
-    }
-    check_fi("fi_cq_read", static_cast<int>(rc));
   }
 }
 
@@ -275,44 +335,53 @@ bool Transport::wait_all(std::vector<WriteContext*> const& ctxs,
   if (!cq_) throw std::runtime_error("CXI CQ missing");
   if (ctxs.empty()) return true;
 
-  std::unordered_set<void*> pending;
-  pending.reserve(ctxs.size());
-  for (WriteContext* ctx : ctxs) {
-    if (!ctx) throw std::runtime_error("CXI write context is null");
-    pending.insert(&ctx->ctx);
-  }
+  auto all_done = [&]() {
+    for (WriteContext* ctx : ctxs) {
+      if (!ctx) throw std::runtime_error("CXI write context is null");
+      if (ctx->in_use) return false;
+    }
+    return true;
+  };
 
   uint32_t spins = 0;
-  while (!pending.empty()) {
-    fi_cq_entry entries[16]{};
-    ssize_t rc = fi_cq_read(cq_, entries, 16);
-    if (rc > 0) {
-      for (ssize_t i = 0; i < rc; ++i) {
-        auto erased = pending.erase(entries[i].op_context);
-        if (erased == 0) {
-          throw std::runtime_error("CXI CQ returned unexpected context");
-        }
-      }
-      continue;
-    }
-    if (rc == -FI_EAGAIN) {
-      if (progress_run &&
-          !progress_run->load(std::memory_order_acquire)) {
+  while (!all_done()) {
+    if (poll(nullptr, 16) == 0) {
+      if (progress_run && !progress_run->load(std::memory_order_acquire)) {
         return false;
       }
       if ((++spins & 0x3ff) == 0) sched_yield();
-      continue;
     }
-    if (rc == -FI_EAVAIL) {
-      fi_cq_err_entry err{};
-      fi_cq_readerr(cq_, &err, 0);
-      char buf[256];
-      char const* msg =
-          fi_cq_strerror(cq_, err.prov_errno, err.err_data, buf, sizeof(buf));
-      throw std::runtime_error(std::string("CXI CQ error: ") +
-                               (msg ? msg : fi_strerror(err.err)));
+  }
+  return true;
+}
+
+WriteContext* Transport::acquire_context() {
+  if (!free_ctxs_.empty()) {
+    WriteContext* c = free_ctxs_.back();
+    free_ctxs_.pop_back();
+    c->wr_ids.clear();
+    return c;
+  }
+  ctx_pool_.push_back(std::make_unique<WriteContext>());
+  return ctx_pool_.back().get();
+}
+
+void Transport::release_context(WriteContext* ctx) {
+  if (!ctx) return;
+  ctx->wr_ids.clear();
+  ctx->in_use = false;
+  free_ctxs_.push_back(ctx);
+}
+
+bool Transport::drain(std::atomic<bool> const* progress_run) {
+  uint32_t spins = 0;
+  while (outstanding_ > 0) {
+    if (poll(nullptr, 16) == 0) {
+      if (progress_run && !progress_run->load(std::memory_order_acquire)) {
+        return false;
+      }
+      if ((++spins & 0x3ff) == 0) sched_yield();
     }
-    check_fi("fi_cq_read", static_cast<int>(rc));
   }
   return true;
 }

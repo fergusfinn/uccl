@@ -415,7 +415,16 @@ void post_rdma_async_batched(ProxyCtx& S, void* buf, size_t num_wrs,
                              std::vector<uint64_t> const& wrs_to_post,
                              std::vector<TransferCmd> const& cmds_to_post,
                              std::vector<std::unique_ptr<ProxyCtx>>& ctxs,
-                             int my_rank, int thread_idx, bool use_normal_mode);
+                             int my_rank, int thread_idx, bool use_normal_mode,
+                             std::unordered_set<uint64_t>& acked_wrs);
+#ifdef USE_CXI
+// Async CXI write path (see rdma.cpp). Fast mode posts writes without
+// waiting; completions retire ring slots via cxi_retire_ctx, which the proxy
+// loop must call regularly on every connected peer ctx.
+bool cxi_fast_mode();
+size_t cxi_retire_ctx(ProxyCtx& ctx, std::unordered_set<uint64_t>& acked_wrs,
+                      size_t budget);
+#endif
 void local_process_completions(ProxyCtx& S,
                                std::unordered_set<uint64_t>& acked_wrs,
                                int thread_idx, ibv_wc* wc, int ne,

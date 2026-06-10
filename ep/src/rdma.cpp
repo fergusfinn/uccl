@@ -1468,15 +1468,53 @@ struct CxiPlannedWrite {
   uint64_t remote_offset = 0;
   uint64_t remote_key = 0;
   size_t bytes = 0;
+  std::vector<uint64_t> wr_ids;
 };
+
+// Fast (default): writes are posted asynchronously and ring slots retire on
+// CQ completion; tail/control atomics are injected immediately behind their
+// writes, relying on same-TX-context submission ordering (validated
+// empirically on Slingshot-11, see uccl-project/uccl#956). Set
+// UCCL_CXI_SYNC_WRITES=1 to restore the conservative
+// post/wait-all/then-atomics behavior.
+bool cxi_fast_mode() {
+  static bool const fast = std::getenv("UCCL_CXI_SYNC_WRITES") == nullptr;
+  return fast;
+}
+
+static size_t cxi_max_outstanding() {
+  static size_t const cap = [] {
+    char const* v = std::getenv("UCCL_CXI_MAX_OUTSTANDING");
+    return v ? std::max(1ul, strtoul(v, nullptr, 10)) : 512ul;
+  }();
+  return cap;
+}
+
+// Poll one peer's transport, retiring completed writes into acked_wrs and
+// returning contexts to the pool. Returns completions consumed.
+size_t cxi_retire_ctx(ProxyCtx& ctx, std::unordered_set<uint64_t>& acked_wrs,
+                      size_t budget) {
+  if (!ctx.cxi_transport) return 0;
+  auto* transport = ctx.cxi_transport.get();
+  size_t consumed = 0;
+  uccl::cxi::WriteContext* done[16];
+  while (consumed < budget) {
+    size_t const n =
+        transport->poll(done, std::min<size_t>(16, budget - consumed));
+    if (n == 0) break;
+    for (size_t i = 0; i < n; ++i) {
+      for (uint64_t wr : done[i]->wr_ids) acked_wrs.insert(wr);
+      transport->release_context(done[i]);
+    }
+    consumed += n;
+  }
+  return consumed;
+}
 
 static void maybe_print_cxi_write_stats(
     int my_rank, std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post,
-    std::vector<CxiPlannedWrite> const& writes,
-    std::unordered_map<uccl::cxi::Transport*,
-                       std::vector<uccl::cxi::WriteContext*>> const&
-        pending_by_transport) {
+    std::vector<CxiPlannedWrite> const& writes) {
   static bool const enabled = std::getenv("UCCL_CXI_STATS") != nullptr;
   if (!enabled || cmds_to_post.empty()) return;
 
@@ -1514,7 +1552,7 @@ static void maybe_print_cxi_write_stats(
   fprintf(stderr,
           "[CXI_STATS] id=%llu rank=%d phase=%s kind=%s cmds=%zu dispatch_cmds=%zu "
           "combine_cmds=%zu writes=%zu bytes=%zu min=%zu max=%zu "
-          "avg=%.1f coalesced=%.2f transports=%zu buckets_le4k=%zu "
+          "avg=%.1f coalesced=%.2f buckets_le4k=%zu "
           "le8k=%zu le16k=%zu le32k=%zu le64k=%zu le128k=%zu le256k=%zu "
           "gt256k=%zu\n",
           (unsigned long long)id, my_rank, phase,
@@ -1528,7 +1566,7 @@ static void maybe_print_cxi_write_stats(
               ? 0.0
               : static_cast<double>(cmds_to_post.size()) /
                     static_cast<double>(writes.size()),
-          pending_by_transport.size(), buckets[0], buckets[1], buckets[2],
+          buckets[0], buckets[1], buckets[2],
           buckets[3], buckets[4], buckets[5], buckets[6], buckets[7]);
 }
 
@@ -1536,7 +1574,8 @@ static void post_rdma_async_batched_cxi(
     std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post,
     std::vector<std::unique_ptr<ProxyCtx>>& ctxs, int my_rank,
-    bool use_normal_mode, std::atomic<bool> const* progress_run) {
+    bool use_normal_mode, std::atomic<bool> const* progress_run,
+    std::unordered_set<uint64_t>& acked_wrs) {
   std::vector<CxiPlannedWrite> writes;
   writes.reserve(cmds_to_post.size());
 
@@ -1544,7 +1583,7 @@ static void post_rdma_async_batched_cxi(
                                 fi_addr_t peer, void* local,
                                 uint64_t local_offset,
                                 uint64_t remote_offset, uint64_t remote_key,
-                                size_t bytes) {
+                                size_t bytes, uint64_t wr_id) {
     if (!writes.empty()) {
       auto& prev = writes.back();
       uintptr_t const prev_local_end =
@@ -1555,15 +1594,16 @@ static void post_rdma_async_batched_cxi(
           prev.remote_offset + prev.bytes == remote_offset &&
           prev_local_end == reinterpret_cast<uintptr_t>(local)) {
         prev.bytes += bytes;
+        prev.wr_ids.push_back(wr_id);
         return;
       }
     }
     writes.push_back(CxiPlannedWrite{transport, ctx, peer, local, local_offset,
-                                     remote_offset, remote_key, bytes});
+                                     remote_offset, remote_key, bytes,
+                                     {wr_id}});
   };
 
   for (size_t i = 0; i < wrs_to_post.size(); ++i) {
-    (void)wrs_to_post;
     auto const& cmd = cmds_to_post[i];
     if (cmd.dst_rank == static_cast<uint32_t>(my_rank)) {
       fprintf(stderr, "Posting CXI write to itself\n");
@@ -1611,9 +1651,47 @@ static void post_rdma_async_batched_cxi(
         reinterpret_cast<uintptr_t>(ctx->cxi_local_base) + local_offset);
     (void)use_normal_mode;
     append_write(ctx->cxi_transport.get(), ctx, ctx->cxi_peer_addr, local,
-                 local_offset, remote_offset, ctx->cxi_remote_key, cmd.bytes);
+                 local_offset, remote_offset, ctx->cxi_remote_key, cmd.bytes,
+                 wrs_to_post[i]);
   }
 
+  maybe_print_cxi_write_stats(my_rank, wrs_to_post, cmds_to_post, writes);
+
+  if (cxi_fast_mode()) {
+    // Async path: post and return. Ring slots retire via cxi_retire_ctx when
+    // completions surface; ordering vs the tail atomics that follow comes
+    // from same-TX-context submission order.
+    size_t const cap = cxi_max_outstanding();
+    for (auto& write : writes) {
+      while (write.transport->outstanding() >= cap) {
+        if (cxi_retire_ctx(*write.ctx, acked_wrs, 64) == 0) {
+          if (progress_run &&
+              !progress_run->load(std::memory_order_acquire))
+            return;
+          cpu_relax();
+        }
+      }
+      uccl::cxi::WriteContext* c = write.transport->acquire_context();
+      c->wr_ids = std::move(write.wr_ids);
+      while (write.transport->try_write(write.peer, write.local, write.bytes,
+                                        write.remote_offset, write.remote_key,
+                                        c) == -FI_EAGAIN) {
+        if (cxi_retire_ctx(*write.ctx, acked_wrs, 64) == 0) {
+          if (progress_run &&
+              !progress_run->load(std::memory_order_acquire)) {
+            write.transport->release_context(c);
+            return;
+          }
+          cpu_relax();
+        }
+      }
+    }
+    return;
+  }
+
+  // Conservative path: post everything, wait for all completions, retire in
+  // bulk. Guarantees write completion (NIC-acked) before the caller posts
+  // the corresponding atomics.
   std::vector<uccl::cxi::WriteContext> write_contexts(writes.size());
   std::unordered_map<uccl::cxi::Transport*,
                      std::vector<uccl::cxi::WriteContext*>>
@@ -1627,12 +1705,11 @@ static void post_rdma_async_batched_cxi(
                            &write_contexts[i]);
     pending_by_transport[write.transport].push_back(&write_contexts[i]);
   }
-  maybe_print_cxi_write_stats(my_rank, wrs_to_post, cmds_to_post, writes,
-                              pending_by_transport);
 
   for (auto& [transport, pending] : pending_by_transport) {
     if (!transport->wait_all(pending, progress_run)) return;
   }
+  for (uint64_t wr : wrs_to_post) acked_wrs.insert(wr);
 }
 #endif
 
@@ -2330,16 +2407,18 @@ void post_rdma_async_batched(ProxyCtx& S, void* buf, size_t num_wrs,
                              std::vector<TransferCmd> const& cmds_to_post,
                              std::vector<std::unique_ptr<ProxyCtx>>& ctxs,
                              int my_rank, int thread_idx,
-                             bool use_normal_mode) {
+                             bool use_normal_mode,
+                             std::unordered_set<uint64_t>& acked_wrs) {
 #ifdef USE_CXI
   (void)S;
   (void)buf;
   (void)num_wrs;
   (void)thread_idx;
   post_rdma_async_batched_cxi(wrs_to_post, cmds_to_post, ctxs, my_rank,
-                              use_normal_mode, &S.progress_run);
+                              use_normal_mode, &S.progress_run, acked_wrs);
   return;
 #endif
+  (void)acked_wrs;
   if (use_normal_mode) {
     post_rdma_async_batched_normal_mode(
         S, buf, num_wrs, wrs_to_post, cmds_to_post, ctxs, my_rank, thread_idx);
@@ -3755,9 +3834,23 @@ void post_atomic_operations(ProxyCtx& S,
     int v = static_cast<int>(cmd.value);
     if (get_is_combine(cmd.cmd_type)) v = 1;
     if (v == kLargeAtomicValue) v = kMaxSendAtomicValue;
-    ctx->cxi_transport->inject_atomic_add64(
-        ctx->cxi_peer_addr, static_cast<int64_t>(static_cast<int32_t>(v)),
-        cmd.req_rptr, ctx->cxi_remote_host_key);
+    if (cxi_fast_mode()) {
+      // try-inject with proper retirement on EAGAIN: the blocking variant's
+      // internal poll would drop pooled contexts' wr_ids.
+      while (ctx->cxi_transport->try_inject_atomic_add64(
+                 ctx->cxi_peer_addr,
+                 static_cast<int64_t>(static_cast<int32_t>(v)), cmd.req_rptr,
+                 ctx->cxi_remote_host_key) == -FI_EAGAIN) {
+        if (cxi_retire_ctx(*ctx, acked_wrs, 64) == 0) {
+          if (!S.progress_run.load(std::memory_order_acquire)) return;
+          cpu_relax();
+        }
+      }
+    } else {
+      ctx->cxi_transport->inject_atomic_add64(
+          ctx->cxi_peer_addr, static_cast<int64_t>(static_cast<int32_t>(v)),
+          cmd.req_rptr, ctx->cxi_remote_host_key);
+    }
     acked_wrs.insert(wrs_to_post[i]);
   }
   return;
