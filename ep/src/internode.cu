@@ -292,7 +292,13 @@ __global__ void notify_dispatch(
       while (num_worst_tokens == 0 &&
              ld_volatile_global(moe_recv_rdma_counter_mapped) != -1)
         ;
-      *moe_recv_rdma_counter_mapped = sum;
+      // Graph-mode (num_worst_tokens > 0) must not write the host-mapped
+      // counter: replays run with no host poll pacing them, so a sum
+      // written mid-flight clobbers the -1 reset of a host-synced eager
+      // dispatch issued while the graph is still executing, deadlocking
+      // its kernel-side wait. Graph consumers read device-side counts.
+      if (num_worst_tokens == 0)
+        *moe_recv_rdma_counter_mapped = sum;
       // }
     }
 
@@ -325,7 +331,8 @@ __global__ void notify_dispatch(
       while (num_worst_tokens == 0 &&
              ld_volatile_global(moe_recv_counter_mapped) != -1)
         ;
-      *moe_recv_counter_mapped = sum;
+      if (num_worst_tokens == 0)
+        *moe_recv_counter_mapped = sum;
       // }
     }
     if (thread_id < num_nvl_experts) {
@@ -340,7 +347,8 @@ __global__ void notify_dispatch(
                  -1)
         ;
       // }
-      moe_recv_expert_counter_mapped[thread_id] = sum;
+      if (num_worst_tokens == 0)
+        moe_recv_expert_counter_mapped[thread_id] = sum;
       // Device-visible copy for CUDA-graph (num_worst_tokens) consumers,
       // who cannot read the host-mapped counter without a sync.
       if (recv_expert_counts_device != nullptr)
