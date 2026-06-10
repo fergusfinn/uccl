@@ -51,6 +51,7 @@ def main():
         # dispatches (no notify/count exchange per iteration)
         recv_x, _, _, _, handle, _ = buffer.dispatch(**args)
         args = dict(x=x, handle=handle, config=args["config"])
+        del recv_x
     # warmup
     for _ in range(5):
         buffer.dispatch(**args)
