@@ -20,6 +20,7 @@ Exit code 0 = all checks pass on all ranks.
 """
 
 import argparse
+import gc
 import os
 import sys
 import time
@@ -164,211 +165,220 @@ def main():
         f"nvl={num_nvl_bytes/1e9:.2f}GB rdma={num_rdma_bytes/1e9:.2f}GB"
     )
 
-    # ---- Phase 0: eager isolation: normal (host-sync) vs worst-tokens ------
-    # Runs both modes on identical inputs and diffs each stage, so a failure
-    # localizes to dispatch-layout vs combine-reduction.
-    for seed in range(3):
-        x, topk_idx, topk_weights = make_inputs(
-            seed, rank, num_tokens, hidden, num_experts, num_topk
-        )
-        layout = buffer.get_dispatch_layout(topk_idx, num_experts)
-        (ntpr, ntprr, ntpe, is_in_rank, _) = layout
-
-        def do_dispatch(worst):
-            return buffer.dispatch(
-                x,
-                num_tokens_per_rank=ntpr,
-                num_tokens_per_rdma_rank=ntprr,
-                is_token_in_rank=is_in_rank,
-                num_tokens_per_expert=ntpe,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                num_worst_tokens=worst,
-                config=config,
+    def run_phases():
+        # ---- Phase 0: eager isolation: normal (host-sync) vs worst-tokens ------
+        # Runs both modes on identical inputs and diffs each stage, so a failure
+        # localizes to dispatch-layout vs combine-reduction.
+        for seed in range(3):
+            x, topk_idx, topk_weights = make_inputs(
+                seed, rank, num_tokens, hidden, num_experts, num_topk
             )
+            layout = buffer.get_dispatch_layout(topk_idx, num_experts)
+            (ntpr, ntprr, ntpe, is_in_rank, _) = layout
 
-        recv_n, _, _, nlist_n, h_n, _ = do_dispatch(0)  # normal: host-synced
-        recv_w, _, _, counts_w, h_w, _ = do_dispatch(num_worst_tokens)
-        torch.cuda.synchronize()
-        check(
-            f"seed={seed} device expert counts vs host list",
-            counts_w.cpu().float(),
-            torch.tensor(nlist_n, dtype=torch.float32, device="cpu"),
-            rank, rtol=0.0, atol=0.0,
-        )
-        real = recv_n.size(0)
-        check(
-            f"seed={seed} dispatch worst-vs-normal recv rows (real={real})",
-            recv_w[:real], recv_n, rank,
-        )
-        c_n, _, _ = buffer.combine(recv_n * 2.0, h_n, config=combine_config)
-        c_w, _, _ = buffer.combine(recv_w * 2.0, h_w, config=combine_config)
-        torch.cuda.synchronize()
-        check(
-            f"seed={seed} normal-path oracle",
-            c_n, expected_combined(x, is_in_rank), rank,
-        )
-        check(f"seed={seed} combine worst-vs-normal", c_w, c_n, rank)
-    torch.cuda.synchronize()
-    dist.barrier(group)
-    log("phase 0 OK: eager worst-tokens dispatch+combine matches the normal path")
+            def do_dispatch(worst):
+                return buffer.dispatch(
+                    x,
+                    num_tokens_per_rank=ntpr,
+                    num_tokens_per_rdma_rank=ntprr,
+                    is_token_in_rank=is_in_rank,
+                    num_tokens_per_expert=ntpe,
+                    topk_idx=topk_idx,
+                    topk_weights=topk_weights,
+                    num_worst_tokens=worst,
+                    config=config,
+                )
 
-    # ---- Phase 1: capture ----------------------------------------------------
-    # Static input buffers; everything downstream lives inside the graph.
-    x_st, topk_idx_st, topk_weights_st = make_inputs(
-        100, rank, num_tokens, hidden, num_experts, num_topk
-    )
-
-    graph = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(graph):
-            combined_st, owner_mask_st, counts_st = run_step(
-                buffer,
-                x_st,
-                topk_idx_st,
-                topk_weights_st,
-                num_experts,
-                num_worst_tokens,
-                config,
-                combine_config,
-            )
-    except Exception as exc:
-        print(f"[rank {rank}] CAPTURE FAILED: {exc!r}", flush=True)
-        raise
-    torch.cuda.synchronize()
-    dist.barrier(group)
-    log("phase 1 OK: dispatch+combine captured into one CUDA graph")
-
-    # ---- Phase 2: replays with fresh data and fresh routing -------------------
-    for trial in range(args.replays):
-        seed = 200 + trial
-        x, topk_idx, topk_weights = make_inputs(
-            seed, rank, num_tokens, hidden, num_experts, num_topk
-        )
-        x_st.copy_(x)
-        topk_idx_st.copy_(topk_idx)
-        topk_weights_st.copy_(topk_weights)
-        graph.replay()
-        torch.cuda.synchronize()
-        check(
-            f"replay trial={trial}",
-            combined_st,
-            expected_combined(x_st, owner_mask_st),
-            rank,
-        )
-        # Cross-check one trial in depth against a fresh eager run.
-        if trial in (0, args.replays // 2):
-            eager_combined, _, eager_counts = run_step(
-                buffer, x, topk_idx, topk_weights, num_experts, num_worst_tokens, config, combine_config
-            )
+            recv_n, _, _, nlist_n, h_n, _ = do_dispatch(0)  # normal: host-synced
+            recv_w, _, _, counts_w, h_w, _ = do_dispatch(num_worst_tokens)
             torch.cuda.synchronize()
-            check(f"replay-vs-eager trial={trial}", combined_st, eager_combined, rank)
             check(
-                f"replay-vs-eager expert counts trial={trial}",
-                counts_st.float(), eager_counts.float(), rank, rtol=0.0, atol=0.0,
+                f"seed={seed} device expert counts vs host list",
+                counts_w.cpu().float(),
+                torch.tensor(nlist_n, dtype=torch.float32, device="cpu"),
+                rank, rtol=0.0, atol=0.0,
             )
-    dist.barrier(group)
-    log(f"phase 2 OK: {args.replays} replays, fresh routing each, all correct")
+            real = recv_n.size(0)
+            check(
+                f"seed={seed} dispatch worst-vs-normal recv rows (real={real})",
+                recv_w[:real], recv_n, rank,
+            )
+            c_n, _, _ = buffer.combine(recv_n * 2.0, h_n, config=combine_config)
+            c_w, _, _ = buffer.combine(recv_w * 2.0, h_w, config=combine_config)
+            torch.cuda.synchronize()
+            check(
+                f"seed={seed} normal-path oracle",
+                c_n, expected_combined(x, is_in_rank), rank,
+            )
+            check(f"seed={seed} combine worst-vs-normal", c_w, c_n, rank)
+        torch.cuda.synchronize()
+        dist.barrier(group)
+        log("phase 0 OK: eager worst-tokens dispatch+combine matches the normal path")
 
-    # ---- Phase 3: interleave eager calls and replays --------------------------
-    for trial in range(10):
-        seed = 300 + trial
-        x, topk_idx, topk_weights = make_inputs(
-            seed, rank, num_tokens, hidden, num_experts, num_topk
+        # ---- Phase 1: capture ----------------------------------------------------
+        # Static input buffers; everything downstream lives inside the graph.
+        x_st, topk_idx_st, topk_weights_st = make_inputs(
+            100, rank, num_tokens, hidden, num_experts, num_topk
         )
-        if trial % 2 == 0:
+
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                combined_st, owner_mask_st, counts_st = run_step(
+                    buffer,
+                    x_st,
+                    topk_idx_st,
+                    topk_weights_st,
+                    num_experts,
+                    num_worst_tokens,
+                    config,
+                    combine_config,
+                )
+        except Exception as exc:
+            print(f"[rank {rank}] CAPTURE FAILED: {exc!r}", flush=True)
+            raise
+        torch.cuda.synchronize()
+        dist.barrier(group)
+        log("phase 1 OK: dispatch+combine captured into one CUDA graph")
+
+        # ---- Phase 2: replays with fresh data and fresh routing -------------------
+        for trial in range(args.replays):
+            seed = 200 + trial
+            x, topk_idx, topk_weights = make_inputs(
+                seed, rank, num_tokens, hidden, num_experts, num_topk
+            )
             x_st.copy_(x)
             topk_idx_st.copy_(topk_idx)
             topk_weights_st.copy_(topk_weights)
             graph.replay()
             torch.cuda.synchronize()
             check(
-                f"mixed-replay trial={trial}",
+                f"replay trial={trial}",
                 combined_st,
                 expected_combined(x_st, owner_mask_st),
                 rank,
             )
-        else:
-            combined, owner_mask, _ = run_step(
-                buffer, x, topk_idx, topk_weights, num_experts, num_worst_tokens, config, combine_config
-            )
-            torch.cuda.synchronize()
-            check(
-                f"mixed-eager trial={trial}",
-                combined,
-                expected_combined(x, owner_mask),
-                rank,
-            )
-    dist.barrier(group)
-    log("phase 3 OK: eager and replayed steps interleave safely on one Buffer")
-
-    # ---- Phase 3b: serving-shaped interleave --------------------------------
-    # Multiple graph shapes captured on ONE Buffer, replays interleaved
-    # across shapes and with host-synced eager dispatches (worst=0), the
-    # way vLLM mixes prefill-eager and decode-replay across many capture
-    # sizes. Each shape gets its own static buffers and worst sizing.
-    shapes = [s for s in (32, 128, num_tokens) if s <= num_tokens]
-    multi = {}
-    for s in shapes:
-        xs, tis, tws = make_inputs(400 + s, rank, s, hidden, num_experts, num_topk)
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            cs, oms, _ = run_step(
-                buffer, xs, tis, tws, num_experts, s * num_ranks, config,
-                combine_config,
-            )
-        torch.cuda.synchronize()
-        multi[s] = (g, xs, tis, tws, cs, oms)
-    dist.barrier(group)
-    log(f"phase 3b: captured shapes {shapes} on one Buffer")
-    for trial in range(30):
-        s = shapes[(trial * 7) % len(shapes)]
-        g, xs, tis, tws, cs, oms = multi[s]
-        seed = 500 + trial
-        x, ti, tw = make_inputs(seed, rank, s, hidden, num_experts, num_topk)
-        xs.copy_(x); tis.copy_(ti); tws.copy_(tw)
-        g.replay()
-        torch.cuda.synchronize()
-        check(f"multi-shape replay trial={trial} shape={s}", cs,
-              expected_combined(xs, oms), rank)
-        if trial % 3 == 2:
-            # host-synced eager step (worst=0), like a serving prefill
-            xe, tie, twe = make_inputs(seed + 1000, rank, num_tokens, hidden,
-                                       num_experts, num_topk)
-            ce, ome, _ = run_step(
-                buffer, xe, tie, twe, num_experts, 0, config, combine_config,
-            )
-            torch.cuda.synchronize()
-            check(f"multi-shape eager trial={trial}", ce,
-                  expected_combined(xe, ome), rank)
-    dist.barrier(group)
-    log("phase 3b OK: cross-shape replay + host-synced eager interleave correct")
-
-    # ---- Phase 4: timing -------------------------------------------------------
-    def timed(fn, iters):
-        torch.cuda.synchronize()
+            # Cross-check one trial in depth against a fresh eager run.
+            if trial in (0, args.replays // 2):
+                eager_combined, _, eager_counts = run_step(
+                    buffer, x, topk_idx, topk_weights, num_experts, num_worst_tokens, config, combine_config
+                )
+                torch.cuda.synchronize()
+                check(f"replay-vs-eager trial={trial}", combined_st, eager_combined, rank)
+                check(
+                    f"replay-vs-eager expert counts trial={trial}",
+                    counts_st.float(), eager_counts.float(), rank, rtol=0.0, atol=0.0,
+                )
         dist.barrier(group)
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            fn()
-        torch.cuda.synchronize()
-        return (time.perf_counter() - t0) / iters * 1e3
+        log(f"phase 2 OK: {args.replays} replays, fresh routing each, all correct")
 
-    eager_ms = timed(
-        lambda: run_step(
-            buffer, x_st, topk_idx_st, topk_weights_st, num_experts,
-            num_worst_tokens, config, combine_config,
-        ),
-        args.timing_iters,
-    )
-    replay_ms = timed(graph.replay, args.timing_iters)
-    log(
-        f"phase 4: eager {eager_ms:.3f} ms/step vs replay {replay_ms:.3f} ms/step "
-        f"({eager_ms / replay_ms:.2f}x)"
-    )
+        # ---- Phase 3: interleave eager calls and replays --------------------------
+        for trial in range(10):
+            seed = 300 + trial
+            x, topk_idx, topk_weights = make_inputs(
+                seed, rank, num_tokens, hidden, num_experts, num_topk
+            )
+            if trial % 2 == 0:
+                x_st.copy_(x)
+                topk_idx_st.copy_(topk_idx)
+                topk_weights_st.copy_(topk_weights)
+                graph.replay()
+                torch.cuda.synchronize()
+                check(
+                    f"mixed-replay trial={trial}",
+                    combined_st,
+                    expected_combined(x_st, owner_mask_st),
+                    rank,
+                )
+            else:
+                combined, owner_mask, _ = run_step(
+                    buffer, x, topk_idx, topk_weights, num_experts, num_worst_tokens, config, combine_config
+                )
+                torch.cuda.synchronize()
+                check(
+                    f"mixed-eager trial={trial}",
+                    combined,
+                    expected_combined(x, owner_mask),
+                    rank,
+                )
+        dist.barrier(group)
+        log("phase 3 OK: eager and replayed steps interleave safely on one Buffer")
 
+        # ---- Phase 3b: serving-shaped interleave --------------------------------
+        # Multiple graph shapes captured on ONE Buffer, replays interleaved
+        # across shapes and with host-synced eager dispatches (worst=0), the
+        # way vLLM mixes prefill-eager and decode-replay across many capture
+        # sizes. Each shape gets its own static buffers and worst sizing.
+        shapes = [s for s in (32, 128, num_tokens) if s <= num_tokens]
+        multi = {}
+        for s in shapes:
+            xs, tis, tws = make_inputs(400 + s, rank, s, hidden, num_experts, num_topk)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                cs, oms, _ = run_step(
+                    buffer, xs, tis, tws, num_experts, s * num_ranks, config,
+                    combine_config,
+                )
+            torch.cuda.synchronize()
+            multi[s] = (g, xs, tis, tws, cs, oms)
+        dist.barrier(group)
+        log(f"phase 3b: captured shapes {shapes} on one Buffer")
+        for trial in range(30):
+            s = shapes[(trial * 7) % len(shapes)]
+            g, xs, tis, tws, cs, oms = multi[s]
+            seed = 500 + trial
+            x, ti, tw = make_inputs(seed, rank, s, hidden, num_experts, num_topk)
+            xs.copy_(x); tis.copy_(ti); tws.copy_(tw)
+            g.replay()
+            torch.cuda.synchronize()
+            check(f"multi-shape replay trial={trial} shape={s}", cs,
+                  expected_combined(xs, oms), rank)
+            if trial % 3 == 2:
+                # host-synced eager step (worst=0), like a serving prefill
+                xe, tie, twe = make_inputs(seed + 1000, rank, num_tokens, hidden,
+                                           num_experts, num_topk)
+                ce, ome, _ = run_step(
+                    buffer, xe, tie, twe, num_experts, 0, config, combine_config,
+                )
+                torch.cuda.synchronize()
+                check(f"multi-shape eager trial={trial}", ce,
+                      expected_combined(xe, ome), rank)
+        dist.barrier(group)
+        log("phase 3b OK: cross-shape replay + host-synced eager interleave correct")
+
+        # ---- Phase 4: timing -------------------------------------------------------
+        def timed(fn, iters):
+            torch.cuda.synchronize()
+            dist.barrier(group)
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            torch.cuda.synchronize()
+            return (time.perf_counter() - t0) / iters * 1e3
+
+        eager_ms = timed(
+            lambda: run_step(
+                buffer, x_st, topk_idx_st, topk_weights_st, num_experts,
+                num_worst_tokens, config, combine_config,
+            ),
+            args.timing_iters,
+        )
+        replay_ms = timed(graph.replay, args.timing_iters)
+        log(
+            f"phase 4: eager {eager_ms:.3f} ms/step vs replay {replay_ms:.3f} ms/step "
+            f"({eager_ms / replay_ms:.2f}x)"
+        )
+
+    run_phases()
+    # Free every CUDA object (captured graphs own private memory pools)
+    # before buffer.destroy() tears down the context: deferred frees issued
+    # after destroy abort at interpreter exit with cudaErrorContextIsDestroyed.
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     dist.barrier(group)
     buffer.destroy()
+    dist.destroy_process_group()
     if rank == 0:
         print("MWE PASS: HT internode dispatch+combine is CUDA-graph capturable "
               "and replay-correct under changing data and routing", flush=True)

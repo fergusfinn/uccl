@@ -9,6 +9,7 @@ Run: 2 nodes x 4 GPUs via run-multinode.sh (same as test_ht_cudagraph).
 """
 
 import argparse
+import gc
 import os
 import sys
 
@@ -181,7 +182,15 @@ def main():
     if rank == 0:
         print(f"RAGGED PASS: {args.trials} eager trials over "
               f"{len(SHAPES)} skew shapes, no hang, values correct", flush=True)
+    # Free every CUDA object (the captured graph owns a private memory pool)
+    # before buffer.destroy() tears down the context: deferred frees issued
+    # after destroy abort at interpreter exit with cudaErrorContextIsDestroyed.
+    del g, xg, sg, tig, twg
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     buffer.destroy()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
