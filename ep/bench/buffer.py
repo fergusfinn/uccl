@@ -1570,6 +1570,18 @@ class Buffer:
                     dtype=torch.int32,
                     device=x.device,
                 )
+            # Device-visible per-expert counts for CUDA-graph mode: the
+            # host list is unavailable without a sync when num_worst_tokens
+            # is set, so the notify kernel also writes a device tensor.
+            recv_expert_counts = (
+                torch.zeros(
+                    (int(num_tokens_per_expert.size(0)) // self.group_size,),
+                    dtype=torch.int32,
+                    device=x.device,
+                )
+                if num_worst_tokens > 0
+                else None
+            )
             (
                 num_recv_tokens,
                 num_rdma_recv_tokens,
@@ -1588,6 +1600,7 @@ class Buffer:
                 int(num_tokens_per_expert.size(0)),
                 int(expert_alignment),
                 int(num_worst_tokens),
+                0 if recv_expert_counts is None else recv_expert_counts.data_ptr(),
                 config,
                 rdma_channel_prefix_matrix.data_ptr(),
                 recv_rdma_rank_prefix_sum.data_ptr(),
@@ -1752,7 +1765,9 @@ class Buffer:
                 (recv_x, recv_x_scales) if x_scales is not None else recv_x,
                 recv_topk_idx,
                 recv_topk_weights,
-                num_recv_tokens_per_expert_list,
+                recv_expert_counts
+                if recv_expert_counts is not None
+                else num_recv_tokens_per_expert_list,
                 handle,
                 EventOverlap(
                     event,

@@ -104,7 +104,8 @@ __global__ void notify_dispatch(
     int const* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
     int const* num_tokens_per_rdma_rank, int* moe_recv_rdma_counter_mapped,
     int const* num_tokens_per_expert, int* moe_recv_expert_counter_mapped,
-    int num_experts, bool const* is_token_in_rank, int num_tokens,
+    int* recv_expert_counts_device, int num_experts,
+    bool const* is_token_in_rank, int num_tokens,
     int num_worst_tokens, int num_channels, int expert_alignment,
     int const rdma_clean_offset, int const rdma_num_int_clean,
     int const nvl_clean_offset, int const nvl_num_int_clean,
@@ -340,6 +341,10 @@ __global__ void notify_dispatch(
         ;
       // }
       moe_recv_expert_counter_mapped[thread_id] = sum;
+      // Device-visible copy for CUDA-graph (num_worst_tokens) consumers,
+      // who cannot read the host-mapped counter without a sync.
+      if (recv_expert_counts_device != nullptr)
+        recv_expert_counts_device[thread_id] = sum;
     }
 
     // Finally barrier
@@ -434,7 +439,8 @@ void notify_dispatch(
     int const* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
     int const* num_tokens_per_rdma_rank, int* moe_recv_rdma_counter_mapped,
     int const* num_tokens_per_expert, int* moe_recv_expert_counter_mapped,
-    int num_experts, bool const* is_token_in_rank, int num_tokens,
+    int* recv_expert_counts_device, int num_experts,
+    bool const* is_token_in_rank, int num_tokens,
     int num_worst_tokens, int num_channels, int hidden_int4, int num_scales,
     int num_topk, int expert_alignment, int* rdma_channel_prefix_matrix,
     int* recv_rdma_rank_prefix_sum, int* gbl_channel_prefix_matrix,
@@ -453,7 +459,8 @@ void notify_dispatch(
                   moe_recv_counter_mapped, num_ranks,                          \
                   num_tokens_per_rdma_rank, moe_recv_rdma_counter_mapped,      \
                   num_tokens_per_expert, moe_recv_expert_counter_mapped,       \
-                  num_experts, is_token_in_rank, num_tokens, num_worst_tokens, \
+                  recv_expert_counts_device, num_experts, is_token_in_rank,    \
+                  num_tokens, num_worst_tokens,                                \
                   num_channels, expert_alignment, rdma_clean_meta.first,       \
                   rdma_clean_meta.second, nvl_clean_meta.first,                \
                   nvl_clean_meta.second, rdma_channel_prefix_matrix,           \
