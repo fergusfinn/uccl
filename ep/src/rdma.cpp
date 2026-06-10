@@ -1491,7 +1491,8 @@ static size_t cxi_max_outstanding() {
 }
 
 // Poll one peer's transport, retiring completed writes into acked_wrs and
-// returning contexts to the pool. Returns completions consumed.
+// returning contexts to the pool, then inject any control atomics whose
+// gating writes have all completed. Returns completions consumed.
 size_t cxi_retire_ctx(ProxyCtx& ctx, std::unordered_set<uint64_t>& acked_wrs,
                       size_t budget) {
   if (!ctx.cxi_transport) return 0;
@@ -1506,9 +1507,37 @@ size_t cxi_retire_ctx(ProxyCtx& ctx, std::unordered_set<uint64_t>& acked_wrs,
       for (uint64_t wr : done[i]->wr_ids) acked_wrs.insert(wr);
       transport->release_context(done[i]);
     }
+    ctx.cxi_writes_completed += n;
     consumed += n;
   }
+
+  // Flush ripe pending atomics in order.
+  while (!ctx.cxi_pending_atomics.empty() &&
+         ctx.cxi_pending_atomics.front().threshold <=
+             ctx.cxi_writes_completed) {
+    auto const& pa = ctx.cxi_pending_atomics.front();
+    while (transport->try_inject_atomic_add64(ctx.cxi_peer_addr, pa.value,
+                                              pa.remote_offset,
+                                              ctx.cxi_remote_host_key) ==
+           -FI_EAGAIN) {
+      // TX full: consume more completions to free credits.
+      size_t const n = transport->poll(done, 16);
+      for (size_t i = 0; i < n; ++i) {
+        for (uint64_t wr : done[i]->wr_ids) acked_wrs.insert(wr);
+        transport->release_context(done[i]);
+      }
+      ctx.cxi_writes_completed += n;
+      if (n == 0) cpu_relax();
+    }
+    ctx.cxi_pending_atomics.pop_front();
+  }
   return consumed;
+}
+
+// True when nothing to this peer is still in flight or deferred.
+static bool cxi_ctx_idle(ProxyCtx& ctx) {
+  return (!ctx.cxi_transport || ctx.cxi_transport->outstanding() == 0) &&
+         ctx.cxi_pending_atomics.empty();
 }
 
 static void maybe_print_cxi_write_stats(
@@ -1685,6 +1714,7 @@ static void post_rdma_async_batched_cxi(
           cpu_relax();
         }
       }
+      ++write.ctx->cxi_writes_posted;
     }
     return;
   }
@@ -3834,22 +3864,30 @@ void post_atomic_operations(ProxyCtx& S,
     int v = static_cast<int>(cmd.value);
     if (get_is_combine(cmd.cmd_type)) v = 1;
     if (v == kLargeAtomicValue) v = kMaxSendAtomicValue;
+    int64_t const value64 = static_cast<int64_t>(static_cast<int32_t>(v));
     if (cxi_fast_mode()) {
-      // try-inject with proper retirement on EAGAIN: the blocking variant's
-      // internal poll would drop pooled contexts' wr_ids.
-      while (ctx->cxi_transport->try_inject_atomic_add64(
-                 ctx->cxi_peer_addr,
-                 static_cast<int64_t>(static_cast<int32_t>(v)), cmd.req_rptr,
-                 ctx->cxi_remote_host_key) == -FI_EAGAIN) {
-        if (cxi_retire_ctx(*ctx, acked_wrs, 64) == 0) {
-          if (!S.progress_run.load(std::memory_order_acquire)) return;
-          cpu_relax();
+      // Control atomics must not overtake the data writes posted before
+      // them. If writes to this peer are still in flight (or earlier
+      // atomics are still queued), defer; cxi_retire_ctx injects them as
+      // their gating writes complete.
+      if (!ctx->cxi_pending_atomics.empty() ||
+          ctx->cxi_writes_completed < ctx->cxi_writes_posted) {
+        ctx->cxi_pending_atomics.push_back(ProxyCtx::CxiPendingAtomic{
+            value64, cmd.req_rptr, ctx->cxi_writes_posted});
+      } else {
+        while (ctx->cxi_transport->try_inject_atomic_add64(
+                   ctx->cxi_peer_addr, value64, cmd.req_rptr,
+                   ctx->cxi_remote_host_key) == -FI_EAGAIN) {
+          if (cxi_retire_ctx(*ctx, acked_wrs, 64) == 0) {
+            if (!S.progress_run.load(std::memory_order_acquire)) return;
+            cpu_relax();
+          }
         }
       }
     } else {
-      ctx->cxi_transport->inject_atomic_add64(
-          ctx->cxi_peer_addr, static_cast<int64_t>(static_cast<int32_t>(v)),
-          cmd.req_rptr, ctx->cxi_remote_host_key);
+      ctx->cxi_transport->inject_atomic_add64(ctx->cxi_peer_addr, value64,
+                                              cmd.req_rptr,
+                                              ctx->cxi_remote_host_key);
     }
     acked_wrs.insert(wrs_to_post[i]);
   }

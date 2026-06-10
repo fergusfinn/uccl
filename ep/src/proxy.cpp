@@ -690,7 +690,9 @@ void Proxy::run_dual() {
 #ifdef USE_CXI
     if (cxi_fast_mode()) {
       for (auto& c : ctxs_for_all_ranks_) {
-        if (c && c->cxi_transport && c->cxi_transport->outstanding() > 0)
+        if (c && c->cxi_transport &&
+            (c->cxi_transport->outstanding() > 0 ||
+             !c->cxi_pending_atomics.empty()))
           cxi_retire_ctx(*c, acked_wrs_, 64);
       }
     }
@@ -729,7 +731,8 @@ void Proxy::run_dual() {
         std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
     for (auto& c : ctxs_for_all_ranks_) {
       if (!c || !c->cxi_transport) continue;
-      while (c->cxi_transport->outstanding() > 0 &&
+      while ((c->cxi_transport->outstanding() > 0 ||
+              !c->cxi_pending_atomics.empty()) &&
              std::chrono::steady_clock::now() < deadline) {
         cxi_retire_ctx(*c, acked_wrs_, 64);
       }
@@ -1196,11 +1199,12 @@ void Proxy::post_gpu_commands_mixed(
 void Proxy::quiet_cq() {
 #ifdef USE_CXI
   if (cxi_fast_mode()) {
-    // Drain all outstanding async writes so quiet means "on the wire and
-    // locally complete", matching the verbs path's semantics.
+    // Drain all outstanding async writes AND deferred control atomics so
+    // quiet means "everything sent", matching the verbs path's semantics.
     for (auto& c : ctxs_for_all_ranks_) {
       if (!c || !c->cxi_transport) continue;
-      while (c->cxi_transport->outstanding() > 0) {
+      while (c->cxi_transport->outstanding() > 0 ||
+             !c->cxi_pending_atomics.empty()) {
         if (cxi_retire_ctx(*c, acked_wrs_, 64) == 0) {
           if (!ctx_.progress_run.load(std::memory_order_acquire)) return;
           cpu_relax();
@@ -1466,6 +1470,15 @@ void Proxy::post_barrier_msg(int dst_rank, bool ack, uint64_t seq) {
   int const dst_node_idx = stride > 0 ? dst_rank / stride : 0;
   int const slot = ack ? cfg_.num_nodes + dst_node_idx : cfg_.node_idx;
   if (cxi_fast_mode()) {
+    // Barriers imply all prior traffic to this peer is on the wire: drain
+    // outstanding writes and deferred atomics first (barriers are rare).
+    while (ctx->cxi_transport->outstanding() > 0 ||
+           !ctx->cxi_pending_atomics.empty()) {
+      if (cxi_retire_ctx(*ctx, acked_wrs_, 64) == 0) {
+        if (!ctx_.progress_run.load(std::memory_order_acquire)) return;
+        cpu_relax();
+      }
+    }
     while (ctx->cxi_transport->try_inject_atomic_add64(
                ctx->cxi_peer_addr, 1, cxi_barrier_slot_offset(slot),
                ctx->cxi_remote_host_key) == -FI_EAGAIN) {

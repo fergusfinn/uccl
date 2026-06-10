@@ -6,6 +6,7 @@
 #include "util/gpu_rt.h"
 #include <infiniband/verbs.h>
 #include <atomic>
+#include <deque>
 #include <map>
 #include <memory>
 #include <unordered_map>
@@ -103,6 +104,21 @@ struct ProxyCtx {
   uint64_t cxi_remote_len = 0;
   uint64_t cxi_remote_host_key = 0;
   uint64_t cxi_remote_host_len = 0;
+
+  // Async write path bookkeeping. Control atomics to this peer must not
+  // overtake the data writes posted before them (with FI_CXI_RDZV_THRESHOLD=0
+  // every write is rendezvous, so same-TX submission order does NOT order
+  // atomic placement vs write placement at the target). Each atomic is
+  // queued with the number of writes posted before it and injected once
+  // that many writes have completed.
+  struct CxiPendingAtomic {
+    int64_t value;
+    uint64_t remote_offset;
+    uint64_t threshold;  // inject when cxi_writes_completed >= threshold
+  };
+  uint64_t cxi_writes_posted = 0;
+  uint64_t cxi_writes_completed = 0;
+  std::deque<CxiPendingAtomic> cxi_pending_atomics;
 #endif
 
 #ifdef USE_DMABUF
