@@ -1841,6 +1841,7 @@ class Buffer:
             rdma_channel_prefix_matrix.data_ptr(),
             rdma_rank_prefix_sum.data_ptr(),
             gbl_channel_prefix_matrix.data_ptr(),
+            gbl_rank_prefix_sum.data_ptr(),
             send_rdma_head.data_ptr(),
             send_nvl_head.data_ptr(),
             config,
