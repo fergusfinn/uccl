@@ -73,42 +73,6 @@ class Buffer:
     # TODO(MaoZiming): Reduce SMs. UCCL Proxy should reduce the usage of SMs.
     num_sms: int = 20
 
-    @staticmethod
-    def _env_int(name: str, default: int = -1) -> int:
-        try:
-            return int(os.environ.get(name, default))
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
-    def _infer_device_index(rank: int) -> int:
-        device_count = torch.cuda.device_count()
-        if device_count <= 0:
-            return torch.cuda.current_device()
-        if device_count == 1:
-            return 0
-
-        local_rank = Buffer._env_int("LOCAL_RANK")
-        local_world_size = Buffer._env_int("LOCAL_WORLD_SIZE")
-        if local_world_size == device_count and 0 <= local_rank < device_count:
-            return local_rank
-
-        # In one-container-per-node launchers (for example vLLM mp workers under
-        # a single Slurm task), every local worker can inherit LOCAL_RANK=0 while
-        # still seeing all local GPUs. EP ranks are laid out contiguously per node,
-        # so rank modulo visible devices is the local CUDA device.
-        return int(rank) % device_count
-
-    @staticmethod
-    def _infer_local_world_size() -> int:
-        device_count = torch.cuda.device_count()
-        local_world_size = Buffer._env_int("LOCAL_WORLD_SIZE")
-        if local_world_size <= 0 or (
-            device_count > 1 and local_world_size < device_count
-        ):
-            return device_count
-        return local_world_size
-
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -142,12 +106,10 @@ class Buffer:
             is_intranode: whether to force intranode-only proxy mode. If set to `None`, infer it from the
                 process-group topology automatically. Explicit `True` is rejected when the group spans multiple nodes.
         """
-        self.rank = group.rank()
-        self.group_size = group.size()
-        self.group = group
-        self.device_index = self._infer_device_index(self.rank)
-        torch.cuda.set_device(self.device_index)
-        device_index = self.device_index
+        if "LOCAL_RANK" in os.environ:
+            device_index = int(os.environ["LOCAL_RANK"])
+        else:
+            device_index = torch.cuda.current_device()
 
         if hasattr(ep, "get_rdma_buffer"):
             # Allocate outside PyTorch's CUDA allocator so RDMA/IPC sees a raw
@@ -188,12 +150,12 @@ class Buffer:
                 )
 
         rdma_buffer_ptr = self.scratch.data_ptr()
-        _local_world = self._infer_local_world_size()
+        _local_world = int(os.environ.get("LOCAL_WORLD_SIZE", -1))
         self.proxies, self.workers = initialize_uccl(
             rdma_buffer_ptr,
             num_rdma_bytes,
-            self.rank,
-            self.group_size,
+            group.rank(),
+            dist.get_world_size(group),
             group,
             use_normal_mode=not low_latency_mode,
             is_intranode=is_intranode,
@@ -202,12 +164,14 @@ class Buffer:
         check_nvlink_connections(group)
 
         # Initialize the CPP runtime
+        self.rank = group.rank()
+        self.group_size = group.size()
+        self.group = group
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self._next_low_latency_combine_buffer = None
-        torch.cuda.set_device(self.device_index)
         self.runtime = ep.Buffer(
             self.rank,
             self.group_size,
@@ -257,23 +221,11 @@ class Buffer:
         for proxy in self.proxies:
             proxy.set_atomic_buffer_ptr(self.proxies[0].get_atomic_buffer_ptr())
 
-    def _set_current_device(self, device: Optional[torch.device] = None) -> int:
-        if device is None:
-            device_index = self.device_index
-        else:
-            device = torch.device(device)
-            if device.type != "cuda":
-                return self.device_index
-            device_index = self.device_index if device.index is None else device.index
-        torch.cuda.set_device(device_index)
-        return int(device_index)
-
     def _ll_compute_stream_ptr(self, device: torch.device):
         """
         Return the current CUDA stream pointer for low-latency runtime calls.
         """
-        device_index = self._set_current_device(device)
-        current = torch.cuda.current_stream(device=device_index)
+        current = torch.cuda.current_stream(device=device)
         return int(current.cuda_stream)
 
     def reset_rdma_buffer(self):
@@ -393,7 +345,6 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        self._set_current_device(x.device)
         for proxy in self.proxies:
             proxy.notify_proxy_thread_adaptive_sleeper()
             proxy.calculate_and_set_dispatch_recv_data_offset(
@@ -563,7 +514,6 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        self._set_current_device(x.device)
         if overlap:
             raise NotImplementedError(
                 "low_latency_combine(overlap=True) is not implemented yet. "
@@ -661,11 +611,10 @@ class Buffer:
         num_ranks = self.group.size()
         num_local_experts = num_experts // num_ranks
         num_recv_tokens = num_ranks * num_max_dispatch_tokens_per_rank
-        self._set_current_device(src_info.device)
         self._next_low_latency_combine_buffer = torch.empty(
             (num_local_experts, num_recv_tokens, hidden),
             dtype=torch.bfloat16,
-            device=src_info.device,
+            device="cuda",
         )
         return self._next_low_latency_combine_buffer
 
@@ -699,10 +648,8 @@ class Buffer:
         Returns:
             stream: the communication stream.
         """
-        self._set_current_device()
         ts = self.runtime.get_comm_stream()
         if isinstance(ts, torch.Stream):
-            torch.cuda.set_device(ts.device_index)
             return torch.cuda.Stream(
                 stream_id=ts.stream_id,
                 device_index=ts.device_index,
@@ -872,7 +819,6 @@ class Buffer:
         if allocate_on_comm_stream:
             assert previous_event is not None and async_finish
 
-        self._set_current_device(topk_idx.device)
         alloc_ctx = (
             torch.cuda.stream(self.get_comm_stream())
             if allocate_on_comm_stream
@@ -1007,8 +953,6 @@ class Buffer:
         """
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
-        x_for_device = x[0] if isinstance(x, tuple) else x
-        self._set_current_device(x_for_device.device)
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
@@ -1334,7 +1278,6 @@ class Buffer:
         """
         # Default config
         config = self.get_combine_config(self.group_size) if config is None else config
-        self._set_current_device(x.device)
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
@@ -1478,7 +1421,6 @@ class Buffer:
         assert config is not None
 
         x, x_scales = x if isinstance(x, tuple) else (x, None)
-        self._set_current_device(x.device)
         num_scales = (
             0 if x_scales is None else (1 if x_scales.dim() == 1 else x_scales.size(1))
         )
@@ -1835,7 +1777,6 @@ class Buffer:
         Normally, you should not directly call this function.
         """
         assert config is not None
-        self._set_current_device(x.device)
 
         # Unpack handle and bias
         (

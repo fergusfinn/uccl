@@ -111,7 +111,10 @@ def detect_group_topology(group: dist.ProcessGroup) -> Tuple[int, int, int, bool
         num_nodes: number of distinct nodes spanned by the group.
         is_intranode: whether all ranks in the group are on the same node.
     """
-    local_rank = torch.cuda.current_device()
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        local_rank = torch.cuda.current_device()
 
     node_token = (
         os.environ.get("NODE_RANK")
@@ -157,7 +160,11 @@ def get_cpu_proxies_meta(proxies, rank, scratch_ptr, scratch_bytes, num_ranks, g
         "listen_ports": [proxy.get_listen_port() for proxy in proxies],
     }
     all_meta = [None] * num_ranks
-    device_index = torch.cuda.current_device()
+    # Use current device or fallback to LOCAL_RANK or 0
+    if "LOCAL_RANK" in os.environ:
+        device_index = int(os.environ["LOCAL_RANK"])
+    else:
+        device_index = torch.cuda.current_device()
     torch.cuda.set_device(device_index)
     dist.all_gather_object(all_meta, meta, group=group)
     rank2meta = {m["rank"]: m for m in all_meta}
@@ -629,7 +636,11 @@ def initialize_uccl(
 
 
 def destroy_uccl(proxies, workers):
-    device_index = torch.cuda.current_device()
+    # Use current device or fallback to LOCAL_RANK
+    if "LOCAL_RANK" in os.environ:
+        device_index = int(os.environ["LOCAL_RANK"])
+    else:
+        device_index = torch.cuda.current_device()
 
     if workers is not None:
         try:
