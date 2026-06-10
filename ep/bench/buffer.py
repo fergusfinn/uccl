@@ -106,10 +106,7 @@ class Buffer:
             is_intranode: whether to force intranode-only proxy mode. If set to `None`, infer it from the
                 process-group topology automatically. Explicit `True` is rejected when the group spans multiple nodes.
         """
-        if "LOCAL_RANK" in os.environ:
-            device_index = int(os.environ["LOCAL_RANK"])
-        else:
-            device_index = torch.cuda.current_device()
+        device_index = torch.cuda.current_device()
 
         if hasattr(ep, "get_rdma_buffer"):
             # Allocate outside PyTorch's CUDA allocator so RDMA/IPC sees a raw
