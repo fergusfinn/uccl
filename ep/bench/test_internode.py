@@ -310,7 +310,19 @@ def test_main(
                             if isinstance(recv_worst_x, tuple)
                             else recv_worst_x
                         )
-                        assert len(empty_list) == 0
+                        if isinstance(empty_list, torch.Tensor):
+                            # Graph-mode contract: device tensor of
+                            # per-local-expert recv counts (host list is
+                            # unavailable without a sync in worst-tokens
+                            # mode). Validate against the reference counts.
+                            assert empty_list.dtype == torch.int32
+                            assert empty_list.is_cuda
+                            assert (
+                                empty_list.cpu().tolist()
+                                == recv_num_tokens_per_expert_list
+                            ), "device recv counts mismatch"
+                        else:
+                            assert len(empty_list) == 0
                         assert num_worst_tokens == recv_worst_x.size(0)
                         assert num_worst_tokens == recv_worst_topk_idx.size(0)
                         assert num_worst_tokens == recv_worst_topk_weights.size(0)
