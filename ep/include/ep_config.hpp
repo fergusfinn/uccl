@@ -276,8 +276,16 @@ struct LowLatencyLayout {
     // rdma_buffer). If they overflow `kAtomicBufferSize`, kernels will spin
     // forever waiting for flags.
     if (atomic_buffer_ptr != nullptr) {
+#ifdef USE_CXI
+      // The CXI barrier reserves the top 4 KiB of the atomic buffer
+      // (see cxi_barrier_slot_offset in proxy.cpp); EP signaling must not
+      // reach into it.
+      EP_HOST_ASSERT(2 * signaling_buffer_bytes_internode_aligned <=
+                     static_cast<size_t>(kAtomicBufferSize) - 4096);
+#else
       EP_HOST_ASSERT(2 * signaling_buffer_bytes_internode_aligned <=
                      static_cast<size_t>(kAtomicBufferSize));
+#endif
     }
 
     // Assign pointers
