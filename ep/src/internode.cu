@@ -104,7 +104,8 @@ __global__ void notify_dispatch(
     int const* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
     int const* num_tokens_per_rdma_rank, int* moe_recv_rdma_counter_mapped,
     int const* num_tokens_per_expert, int* moe_recv_expert_counter_mapped,
-    int num_experts, bool const* is_token_in_rank, int num_tokens,
+    int* recv_expert_counts_device, int num_experts,
+    bool const* is_token_in_rank, int num_tokens,
     int num_worst_tokens, int num_channels, int expert_alignment,
     int const rdma_clean_offset, int const rdma_num_int_clean,
     int const nvl_clean_offset, int const nvl_num_int_clean,
@@ -288,9 +289,16 @@ __global__ void notify_dispatch(
       // know why. num_worst_tokens = 0, but somehow wrapping it with the
       // conditional will cause deadlock. Removing the ``if" is logically
       // redundant but harmless. if (num_worst_tokens == 0) {
-      while (ld_volatile_global(moe_recv_rdma_counter_mapped) != -1)
+      while (num_worst_tokens == 0 &&
+             ld_volatile_global(moe_recv_rdma_counter_mapped) != -1)
         ;
-      *moe_recv_rdma_counter_mapped = sum;
+      // Graph-mode (num_worst_tokens > 0) must not write the host-mapped
+      // counter: replays run with no host poll pacing them, so a sum
+      // written mid-flight clobbers the -1 reset of a host-synced eager
+      // dispatch issued while the graph is still executing, deadlocking
+      // its kernel-side wait. Graph consumers read device-side counts.
+      if (num_worst_tokens == 0)
+        *moe_recv_rdma_counter_mapped = sum;
       // }
     }
 
@@ -320,9 +328,11 @@ __global__ void notify_dispatch(
         recv_gbl_rank_prefix_sum[i] = sum;
       }
       // if (num_worst_tokens == 0) {
-      while (ld_volatile_global(moe_recv_counter_mapped) != -1)
+      while (num_worst_tokens == 0 &&
+             ld_volatile_global(moe_recv_counter_mapped) != -1)
         ;
-      *moe_recv_counter_mapped = sum;
+      if (num_worst_tokens == 0)
+        *moe_recv_counter_mapped = sum;
       // }
     }
     if (thread_id < num_nvl_experts) {
@@ -332,11 +342,17 @@ __global__ void notify_dispatch(
         sum += nvl_recv_num_tokens_per_expert.buffer(i)[thread_id];
       sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
       // if (num_worst_tokens == 0) {
-      while (ld_volatile_global(moe_recv_expert_counter_mapped + thread_id) !=
-             -1)
+      while (num_worst_tokens == 0 &&
+             ld_volatile_global(moe_recv_expert_counter_mapped + thread_id) !=
+                 -1)
         ;
       // }
-      moe_recv_expert_counter_mapped[thread_id] = sum;
+      if (num_worst_tokens == 0)
+        moe_recv_expert_counter_mapped[thread_id] = sum;
+      // Device-visible copy for CUDA-graph (num_worst_tokens) consumers,
+      // who cannot read the host-mapped counter without a sync.
+      if (recv_expert_counts_device != nullptr)
+        recv_expert_counts_device[thread_id] = sum;
     }
 
     // Finally barrier
@@ -431,7 +447,8 @@ void notify_dispatch(
     int const* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
     int const* num_tokens_per_rdma_rank, int* moe_recv_rdma_counter_mapped,
     int const* num_tokens_per_expert, int* moe_recv_expert_counter_mapped,
-    int num_experts, bool const* is_token_in_rank, int num_tokens,
+    int* recv_expert_counts_device, int num_experts,
+    bool const* is_token_in_rank, int num_tokens,
     int num_worst_tokens, int num_channels, int hidden_int4, int num_scales,
     int num_topk, int expert_alignment, int* rdma_channel_prefix_matrix,
     int* recv_rdma_rank_prefix_sum, int* gbl_channel_prefix_matrix,
@@ -450,7 +467,8 @@ void notify_dispatch(
                   moe_recv_counter_mapped, num_ranks,                          \
                   num_tokens_per_rdma_rank, moe_recv_rdma_counter_mapped,      \
                   num_tokens_per_expert, moe_recv_expert_counter_mapped,       \
-                  num_experts, is_token_in_rank, num_tokens, num_worst_tokens, \
+                  recv_expert_counts_device, num_experts, is_token_in_rank,    \
+                  num_tokens, num_worst_tokens,                                \
                   num_channels, expert_alignment, rdma_clean_meta.first,       \
                   rdma_clean_meta.second, nvl_clean_meta.first,                \
                   nvl_clean_meta.second, rdma_channel_prefix_matrix,           \
@@ -2218,7 +2236,8 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
             int const* combined_rdma_head, int const* combined_nvl_head,
             SourceMeta const* src_meta, int const* rdma_channel_prefix_matrix,
             int const* rdma_rank_prefix_sum,
-            int const* gbl_channel_prefix_matrix, int num_tokens,
+            int const* gbl_channel_prefix_matrix,
+            int const* gbl_rank_prefix_sum, int num_tokens,
             int num_combined_tokens, int hidden, int num_topk,
             void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens,
             int num_max_rdma_chunked_recv_tokens, void** buffer_ptrs,
@@ -2339,8 +2358,10 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
           (lane_id * NUM_MAX_NVL_PEERS + dst_nvl_rank) * num_channels +
           channel_id;
       token_start_idx = gbl_channel_prefix_matrix[prefix_idx];
+      // In worst-tokens (CUDA graph) mode num_tokens is the padded row
+      // count; the real total received lives in gbl_rank_prefix_sum.
       token_end_idx = (prefix_idx == num_channels * num_ranks - 1)
-                          ? num_tokens
+                          ? gbl_rank_prefix_sum[num_ranks - 1]
                           : gbl_channel_prefix_matrix[prefix_idx + 1];
     }
     __syncwarp();
@@ -3025,7 +3046,8 @@ void combine(cudaDataType_t type, void* combined_x,
              int const* combined_rdma_head, int const* combined_nvl_head,
              void const* src_meta, int const* rdma_channel_prefix_matrix,
              int const* rdma_rank_prefix_sum,
-             int const* gbl_channel_prefix_matrix, int num_tokens,
+             int const* gbl_channel_prefix_matrix,
+             int const* gbl_rank_prefix_sum, int num_tokens,
              int num_combined_tokens, int hidden, int num_topk,
              void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens,
              int num_max_rdma_chunked_recv_tokens, void** buffer_ptrs,
@@ -3066,7 +3088,8 @@ void combine(cudaDataType_t type, void* combined_x,
         reinterpret_cast<int4 const*>(bias_1), combined_rdma_head,          \
         combined_nvl_head, reinterpret_cast<SourceMeta const*>(src_meta),   \
         rdma_channel_prefix_matrix, rdma_rank_prefix_sum,                   \
-        gbl_channel_prefix_matrix, num_tokens, num_combined_tokens, hidden, \
+        gbl_channel_prefix_matrix, gbl_rank_prefix_sum, num_tokens,         \
+        num_combined_tokens, hidden,                                        \
         num_topk, rdma_buffer_ptr, num_max_rdma_chunked_send_tokens,        \
         num_max_rdma_chunked_recv_tokens, buffer_ptrs,                      \
         num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,   \
