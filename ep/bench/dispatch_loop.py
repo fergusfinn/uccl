@@ -4,7 +4,7 @@ Runs buffer.dispatch() at a fixed config in a tight loop for DURATION_S
 seconds (per torchrun-style rank). Bracket externally with CXI telemetry
 snapshots to measure true NIC bytes/sec.
 """
-import os, time
+import gc, os, time
 import torch
 import torch.distributed as dist
 from buffer import Buffer
@@ -72,6 +72,12 @@ def main():
           f"rdma_tokens={rdma_tokens} bytes/iter={bytes_per_iter} "
           f"offered_GBps={iters * bytes_per_iter / elapsed / 1e9:.2f}",
           flush=True)
+    # Free every CUDA object before buffer.destroy() tears down the
+    # context (deferred frees after destroy abort at interpreter exit).
+    del x, scores, topk_idx, topk_weights, args
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     dist.barrier(group)
     buffer.destroy()
     dist.destroy_process_group()
