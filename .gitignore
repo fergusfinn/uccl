@@ -111,4 +111,4 @@ thirdparty/gdrcopy/
 .worktrees/
 worktrees/
 *.csv
-*.egg-info/
+*.egg-info//core
