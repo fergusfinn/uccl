@@ -54,7 +54,7 @@ SHAPES = [
 
 
 def run_eager_step(buffer, rank, num_tokens, hidden, num_experts, num_topk,
-                   config, combine_config, seed):
+                   config, combine_config, seed, check=True):
     g = torch.Generator(device="cuda")
     g.manual_seed(seed * 8192 + rank)
     n = max(num_tokens, 0)
@@ -84,7 +84,7 @@ def run_eager_step(buffer, rank, num_tokens, hidden, num_experts, num_topk,
     )
     recv_x = recv_x * 2.0
     combined_x, _, _ = buffer.combine(recv_x, handle, config=combine_config)
-    if n > 0:
+    if n > 0 and check:
         owner = is_in_rank.sum(dim=1).to(torch.bfloat16).unsqueeze(1)
         want = 2.0 * owner * x
         if not torch.allclose(combined_x.float(), want.float(), rtol=0.02, atol=1e-3):
@@ -99,6 +99,8 @@ def main():
     parser.add_argument("--num-topk", type=int, default=6)
     parser.add_argument("--num-sms", type=int, default=24)
     parser.add_argument("--trials", type=int, default=120)
+    parser.add_argument("--chaos-iters", type=int, default=400)
+    parser.add_argument("--layers-per-step", type=int, default=8)
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -168,6 +170,93 @@ def main():
     dist.barrier(group)
     if rank == 0:
         print("[ragged] phase R OK", flush=True)
+
+    # Phase R2: serving-shaped chaos. Mimics the ragged-traffic serving
+    # pattern that wedged 2026-06-10 (combine RDMA receiver starvation):
+    # several worst-token graphs of different shapes on ONE buffer, replays
+    # round-robin, interleaved with host-synced eager steps of wildly
+    # ragged shapes (including zero-token ranks and prefill-sized bursts)
+    # and with zero-routed "dummy step" replays (all topk = -1, like DP
+    # idle ranks). Schedule is seeded and identical on every rank
+    # (serving's DP mode coordination keeps ranks in lockstep too). No
+    # syncs between iterations.
+    cap_shapes = [64, 160, 256]
+    graphs = {}
+    for s in cap_shapes:
+        gx = torch.randn((s, args.hidden), dtype=torch.bfloat16) * 0.1
+        gs = torch.randn((s, args.num_experts), dtype=torch.float32)
+        gti = torch.topk(gs, args.num_topk, dim=-1, largest=True,
+                         sorted=False)[1]
+        gtw = torch.ones((s, args.num_topk), dtype=torch.float32)
+
+        def gstep(gx=gx, gti=gti, gtw=gtw, s=s):
+            # A serving decode step is ~40 MoE layers in ONE graph:
+            # back-to-back dispatch+combine pairs, deep in-flight comm.
+            for _layer in range(args.layers_per_step):
+                (a_, b_, c_, d_, _) = buffer.get_dispatch_layout(
+                    gti, args.num_experts)
+                rx, _, _, _, h, _ = buffer.dispatch(
+                    gx, num_tokens_per_rank=a_, num_tokens_per_rdma_rank=b_,
+                    is_token_in_rank=d_, num_tokens_per_expert=c_,
+                    topk_idx=gti, topk_weights=gtw,
+                    num_worst_tokens=s * num_ranks, config=config,
+                )
+                rx2 = rx * 2.0
+                cx, _, _ = buffer.combine(rx2, h, config=combine_config)
+            return cx
+
+        gstep()
+        torch.cuda.synchronize()
+        gg = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gg):
+            gstep()
+        torch.cuda.synchronize()
+        graphs[s] = (gg, gti)
+    dist.barrier(group)
+    if rank == 0:
+        print(f"[ragged] phase R2: serving chaos over shapes {cap_shapes}",
+              flush=True)
+    # Eager shapes: the observed wedge table plus prefill-sized bursts.
+    R2_EAGER = SHAPES + [
+        [1946, 0, 0, 0, 973, 0, 0, 0],     # big ragged prefill chunks
+        [0, 0, 0, 0, 0, 0, 0, 102],        # almost-idle wave
+    ]
+    import random
+    rng = random.Random(777)  # same schedule on all ranks
+    for it in range(args.chaos_iters):
+        op = rng.randrange(10)
+        s = cap_shapes[rng.randrange(len(cap_shapes))]
+        eshape = R2_EAGER[rng.randrange(len(R2_EAGER))]
+        if op < 5:
+            graphs[s][0].replay()           # decode-wave replay
+        elif op < 7:
+            gg, gti = graphs[s]
+            saved = gti.clone()
+            gti.fill_(-1)                   # dummy step: nothing routed
+            gg.replay()
+            gti.copy_(saved)
+        else:
+            # eager "prefill" step: layers back-to-back, value check only
+            # at the synced boundary below (serving never syncs mid-step)
+            for _layer in range(args.layers_per_step):
+                run_eager_step(
+                    buffer, rank, eshape[rank], args.hidden,
+                    args.num_experts, args.num_topk, config, combine_config,
+                    seed=9000 + it, check=(_layer == 0 and it % 25 == 24),
+                )
+        if it % 25 == 24:
+            torch.cuda.synchronize()
+            dist.barrier(group)
+            if rank == 0:
+                print(f"[ragged] phase R2: {it + 1}/{args.chaos_iters}",
+                      flush=True)
+    torch.cuda.synchronize()
+    dist.barrier(group)
+    if rank == 0:
+        print("[ragged] phase R2 OK", flush=True)
+    for s in cap_shapes:
+        del graphs[s]
+    graphs.clear()
 
     for trial in range(args.trials):
         shape = SHAPES[trial % len(SHAPES)]
