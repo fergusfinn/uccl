@@ -27,7 +27,8 @@ class EPException : public std::exception {
   do {                                                                      \
     cudaError_t e = (cmd);                                                  \
     if (e != cudaSuccess) {                                                 \
-      throw EPException("CUDA", __FILE__, __LINE__, cudaGetErrorString(e)); \
+      throw EPException("CUDA", __FILE__, __LINE__,                         \
+                        std::string(#cmd) + ": " + cudaGetErrorString(e));  \
     }                                                                       \
   } while (0)
 #endif

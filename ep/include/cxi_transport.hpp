@@ -40,6 +40,9 @@ class Transport {
   fi_addr_t insert_peer(EndpointInfo const& peer);
   void write(fi_addr_t peer, void* local, size_t bytes, uint64_t remote_offset,
              uint64_t remote_key, WriteContext* ctx);
+  void fetch_atomic_add64(fi_addr_t peer, int64_t value,
+                          uint64_t remote_offset, uint64_t remote_key,
+                          size_t result_index, WriteContext* ctx);
   void inject_atomic_add64(fi_addr_t peer, int64_t value,
                            uint64_t remote_offset, uint64_t remote_key);
   void wait(WriteContext* ctx);
@@ -55,10 +58,17 @@ class Transport {
   fid_av* av_ = nullptr;
   fid_mr* mr_ = nullptr;
   fid_mr* host_mr_ = nullptr;
+  fid_mr* atomic_source_mr_ = nullptr;
+  fid_mr* atomic_result_mr_ = nullptr;
   void* cuda_ptr_ = nullptr;
   size_t cuda_size_ = 0;
   void* host_ptr_ = nullptr;
   size_t host_size_ = 0;
+  int64_t* atomic_source_ptr_ = nullptr;
+  int64_t* atomic_result_ptr_ = nullptr;
+  size_t atomic_buffer_count_ = 0;
+
+  void ensure_atomic_buffers(size_t count);
 };
 
 }  // namespace uccl::cxi

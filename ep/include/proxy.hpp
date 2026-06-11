@@ -21,6 +21,7 @@
 #endif
 #include "adaptive_sleeper.hpp"
 #include "d2h_queue_host.hpp"
+#include <condition_variable>
 #include <deque>
 #include <set>
 #include <tuple>
@@ -81,6 +82,7 @@ class Proxy {
   double avg_rdma_write_us() const;
   double avg_wr_latency_us() const;
   uint64_t completed_wr() const;
+  ProxyMetrics* metrics_ptr();
 
   void set_peers_meta(std::vector<PeerMeta> const& peers);
   void set_bench_d2h_channel_addrs(std::vector<uintptr_t> const& addrs);
@@ -109,6 +111,14 @@ class Proxy {
   void barrier_check();
   void quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds);
   void quiet_cq();
+  void start_metrics_emitter();
+  void stop_metrics_emitter();
+  void metrics_loop();
+  ProxyMetricsSnapshot metrics_snapshot() const;
+  void emit_metrics_delta(ProxyMetricsSnapshot const& previous,
+                          std::chrono::steady_clock::time_point previous_time,
+                          bool final);
+  int metrics_interval_ms() const;
   RDMAConnectionInfo local_info_{}, remote_info_{};
 
   // Reuse across multiple calls to avoid reallocations
@@ -127,6 +137,13 @@ class Proxy {
   // Sender loop aggregates
   std::chrono::duration<double, std::micro> total_rdma_write_durations_ =
       std::chrono::duration<double, std::micro>::zero();
+
+  ProxyMetrics metrics_;
+  bool metrics_enabled_ = false;
+  std::atomic<bool> metrics_run_{false};
+  std::thread metrics_thread_;
+  std::mutex metrics_mu_;
+  std::condition_variable metrics_cv_;
 
   // For exchanging RDMA metadata with peers.
   int listen_fd_;

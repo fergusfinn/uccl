@@ -1483,16 +1483,7 @@ static void maybe_print_cxi_write_stats(
   size_t total_bytes = 0;
   size_t min_bytes = SIZE_MAX;
   size_t max_bytes = 0;
-  size_t dispatch_cmds = 0;
-  size_t combine_cmds = 0;
   std::array<size_t, 8> buckets{};
-  for (auto const& cmd : cmds_to_post) {
-    if (get_is_combine(cmd.cmd_type)) {
-      ++combine_cmds;
-    } else {
-      ++dispatch_cmds;
-    }
-  }
   for (auto const& write : writes) {
     total_bytes += write.bytes;
     min_bytes = std::min(min_bytes, write.bytes);
@@ -1509,17 +1500,13 @@ static void maybe_print_cxi_write_stats(
 
   static std::atomic<uint64_t> seq{0};
   uint64_t const id = seq.fetch_add(1, std::memory_order_relaxed);
-  char const* phase = std::getenv("UCCL_CXI_PHASE");
-  if (!phase) phase = "unset";
   fprintf(stderr,
-          "[CXI_STATS] id=%llu rank=%d phase=%s kind=%s cmds=%zu dispatch_cmds=%zu "
-          "combine_cmds=%zu writes=%zu bytes=%zu min=%zu max=%zu "
+          "[CXI_STATS] id=%llu rank=%d cmds=%zu writes=%zu bytes=%zu "
+          "min=%zu max=%zu "
           "avg=%.1f coalesced=%.2f transports=%zu buckets_le4k=%zu "
           "le8k=%zu le16k=%zu le32k=%zu le64k=%zu le128k=%zu le256k=%zu "
           "gt256k=%zu\n",
-          (unsigned long long)id, my_rank, phase,
-          combine_cmds != 0 && dispatch_cmds == 0 ? "combine" : "dispatch",
-          wrs_to_post.size(), dispatch_cmds, combine_cmds, writes.size(),
+          (unsigned long long)id, my_rank, wrs_to_post.size(), writes.size(),
           total_bytes, min_bytes, max_bytes,
           writes.empty() ? 0.0
                          : static_cast<double>(total_bytes) /
@@ -1532,11 +1519,31 @@ static void maybe_print_cxi_write_stats(
           buckets[3], buckets[4], buckets[5], buckets[6], buckets[7]);
 }
 
+static void record_cxi_metrics(ProxyMetrics* metrics,
+                               std::vector<CxiPlannedWrite> const& writes,
+                               uint64_t active_ns) {
+  if (!metrics) return;
+
+  uint64_t completed_bytes = 0;
+
+  for (auto const& write : writes) {
+    completed_bytes += static_cast<uint64_t>(write.bytes);
+  }
+
+  metrics->cxi_completed_bytes.fetch_add(completed_bytes,
+                                         std::memory_order_relaxed);
+  metrics->cxi_completed_writes.fetch_add(static_cast<uint64_t>(writes.size()),
+                                          std::memory_order_relaxed);
+  metrics->cxi_completed_batches.fetch_add(1, std::memory_order_relaxed);
+  metrics->cxi_active_ns.fetch_add(active_ns, std::memory_order_relaxed);
+}
+
 static void post_rdma_async_batched_cxi(
     std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post,
     std::vector<std::unique_ptr<ProxyCtx>>& ctxs, int my_rank,
-    bool use_normal_mode, std::atomic<bool> const* progress_run) {
+    bool use_normal_mode, std::atomic<bool> const* progress_run,
+    ProxyMetrics* metrics) {
   std::vector<CxiPlannedWrite> writes;
   writes.reserve(cmds_to_post.size());
 
@@ -1620,6 +1627,7 @@ static void post_rdma_async_batched_cxi(
       pending_by_transport;
   pending_by_transport.reserve(writes.size());
 
+  auto const active_start = std::chrono::steady_clock::now();
   for (size_t i = 0; i < writes.size(); ++i) {
     auto const& write = writes[i];
     write.transport->write(write.peer, write.local, write.bytes,
@@ -1633,6 +1641,12 @@ static void post_rdma_async_batched_cxi(
   for (auto& [transport, pending] : pending_by_transport) {
     if (!transport->wait_all(pending, progress_run)) return;
   }
+  auto const active_end = std::chrono::steady_clock::now();
+  uint64_t const active_ns =
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                active_end - active_start)
+                                .count());
+  record_cxi_metrics(metrics, writes, active_ns);
 }
 #endif
 
@@ -2330,16 +2344,17 @@ void post_rdma_async_batched(ProxyCtx& S, void* buf, size_t num_wrs,
                              std::vector<TransferCmd> const& cmds_to_post,
                              std::vector<std::unique_ptr<ProxyCtx>>& ctxs,
                              int my_rank, int thread_idx,
-                             bool use_normal_mode) {
+                             bool use_normal_mode, ProxyMetrics* metrics) {
 #ifdef USE_CXI
   (void)S;
   (void)buf;
   (void)num_wrs;
   (void)thread_idx;
   post_rdma_async_batched_cxi(wrs_to_post, cmds_to_post, ctxs, my_rank,
-                              use_normal_mode, &S.progress_run);
+                              use_normal_mode, &S.progress_run, metrics);
   return;
 #endif
+  (void)metrics;
   if (use_normal_mode) {
     post_rdma_async_batched_normal_mode(
         S, buf, num_wrs, wrs_to_post, cmds_to_post, ctxs, my_rank, thread_idx);
@@ -3730,6 +3745,12 @@ void post_atomic_operations(ProxyCtx& S,
             wrs_to_post.size(), cmds_to_post.size());
     std::abort();
   }
+
+  std::vector<uccl::cxi::WriteContext> atomic_contexts(cmds_to_post.size());
+  std::unordered_map<uccl::cxi::Transport*, std::vector<uccl::cxi::WriteContext*>>
+      pending_by_transport;
+  pending_by_transport.reserve(cmds_to_post.size());
+
   for (size_t i = 0; i < cmds_to_post.size(); ++i) {
     if (!S.progress_run.load(std::memory_order_acquire)) return;
     auto const& cmd = cmds_to_post[i];
@@ -3755,9 +3776,18 @@ void post_atomic_operations(ProxyCtx& S,
     int v = static_cast<int>(cmd.value);
     if (get_is_combine(cmd.cmd_type)) v = 1;
     if (v == kLargeAtomicValue) v = kMaxSendAtomicValue;
-    ctx->cxi_transport->inject_atomic_add64(
+    auto* atomic_context = &atomic_contexts[i];
+    ctx->cxi_transport->fetch_atomic_add64(
         ctx->cxi_peer_addr, static_cast<int64_t>(static_cast<int32_t>(v)),
-        cmd.req_rptr, ctx->cxi_remote_host_key);
+        cmd.req_rptr, ctx->cxi_remote_host_key, i, atomic_context);
+    pending_by_transport[ctx->cxi_transport.get()].push_back(atomic_context);
+  }
+
+  for (auto& [transport, pending] : pending_by_transport) {
+    if (!transport->wait_all(pending, &S.progress_run)) return;
+  }
+
+  for (size_t i = 0; i < wrs_to_post.size(); ++i) {
     acked_wrs.insert(wrs_to_post[i]);
   }
   return;

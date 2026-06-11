@@ -197,26 +197,50 @@ void UcclProxy::start(Mode m) {
   running_.store(true, std::memory_order_release);
 
   thread_ = std::thread([this]() {
-    if (is_intranode_) {
-      std::printf("UcclProxy: no peer IP set, running in local mode\n");
-      proxy_->run_local();
-      return;
-    }
-    switch (mode_) {
-      case Mode::Sender:
-        proxy_->run_sender();
-        break;
-      case Mode::Remote:
-        proxy_->run_remote();
-        break;
-      case Mode::Local:
+    try {
+      if (is_intranode_) {
+        std::printf("UcclProxy: no peer IP set, running in local mode\n");
         proxy_->run_local();
-        break;
-      case Mode::Dual:
-        proxy_->run_dual();
-        break;
-      default:
-        break;
+        return;
+      }
+      switch (mode_) {
+        case Mode::Sender:
+          proxy_->run_sender();
+          break;
+        case Mode::Remote:
+          proxy_->run_remote();
+          break;
+        case Mode::Local:
+          proxy_->run_local();
+          break;
+        case Mode::Dual:
+          proxy_->run_dual();
+          break;
+        default:
+          break;
+      }
+    } catch (std::exception const& exc) {
+      auto const& cfg = proxy_->cfg_;
+      std::fprintf(stderr,
+                   "[UcclProxy] uncaught proxy thread exception: mode=%d "
+                   "rank=%d local_rank=%d node_idx=%d thread_idx=%d "
+                   "is_intranode=%d gpu_buffer=%p total_size=%zu error=%s\n",
+                   static_cast<int>(mode_), cfg.rank, cfg.local_rank,
+                   cfg.node_idx, cfg.thread_idx, is_intranode_ ? 1 : 0,
+                   cfg.gpu_buffer, cfg.total_size, exc.what());
+      std::fflush(stderr);
+      std::abort();
+    } catch (...) {
+      auto const& cfg = proxy_->cfg_;
+      std::fprintf(stderr,
+                   "[UcclProxy] uncaught non-std proxy thread exception: "
+                   "mode=%d rank=%d local_rank=%d node_idx=%d thread_idx=%d "
+                   "is_intranode=%d gpu_buffer=%p total_size=%zu\n",
+                   static_cast<int>(mode_), cfg.rank, cfg.local_rank,
+                   cfg.node_idx, cfg.thread_idx, is_intranode_ ? 1 : 0,
+                   cfg.gpu_buffer, cfg.total_size);
+      std::fflush(stderr);
+      std::abort();
     }
   });
 }

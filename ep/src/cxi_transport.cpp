@@ -48,6 +48,10 @@ fi_threading threading_hint() {
 }  // namespace
 
 Transport::~Transport() {
+  if (atomic_source_mr_) fi_close(&atomic_source_mr_->fid);
+  if (atomic_result_mr_) fi_close(&atomic_result_mr_->fid);
+  std::free(atomic_source_ptr_);
+  std::free(atomic_result_ptr_);
   if (host_mr_) fi_close(&host_mr_->fid);
   if (mr_) fi_close(&mr_->fid);
   if (av_) fi_close(&av_->fid);
@@ -70,7 +74,7 @@ void Transport::init(int device_index) {
   }
   hints->ep_attr->type = FI_EP_RDM;
   hints->caps = FI_TAGGED | FI_MSG | FI_HMEM | FI_RMA | FI_READ | FI_WRITE |
-                FI_ATOMIC | FI_REMOTE_WRITE | FI_DIRECTED_RECV |
+                FI_ATOMIC | FI_REMOTE_WRITE | FI_REMOTE_READ | FI_DIRECTED_RECV |
                 FI_LOCAL_COMM | FI_REMOTE_COMM;
   hints->mode = FI_CONTEXT | FI_CONTEXT2;
     hints->domain_attr->threading = threading_hint();
@@ -111,6 +115,13 @@ void Transport::init(int device_index) {
 #endif
 
     check_fi("fi_enable", fi_enable(ep_));
+    size_t fetch_atomic_count = 0;
+    check_fi("fi_fetch_atomicvalid(add64)",
+             fi_fetch_atomicvalid(ep_, FI_INT64, FI_SUM,
+                                  &fetch_atomic_count));
+    if (fetch_atomic_count < 1) {
+      throw std::runtime_error("CXI provider does not support add64 fetch atomics");
+    }
   } catch (...) {
     fi_freeinfo(hints);
     throw;
@@ -230,6 +241,104 @@ void Transport::write(fi_addr_t peer, void* local, size_t bytes,
   check_fi("fi_write(cuda)",
            fi_write(ep_, local, bytes, fi_mr_desc(local_mr), peer,
                     remote_offset, remote_key, &ctx->ctx));
+}
+
+void Transport::ensure_atomic_buffers(size_t count) {
+  if (count <= atomic_buffer_count_) return;
+  if (!domain_ || !ep_) {
+    throw std::runtime_error("CXI transport not initialized");
+  }
+
+  if (atomic_source_mr_) {
+    fi_close(&atomic_source_mr_->fid);
+    atomic_source_mr_ = nullptr;
+  }
+  if (atomic_result_mr_) {
+    fi_close(&atomic_result_mr_->fid);
+    atomic_result_mr_ = nullptr;
+  }
+  std::free(atomic_source_ptr_);
+  std::free(atomic_result_ptr_);
+  atomic_source_ptr_ = nullptr;
+  atomic_result_ptr_ = nullptr;
+  atomic_buffer_count_ = 0;
+
+  size_t const bytes = count * sizeof(int64_t);
+  void* source = nullptr;
+  void* result = nullptr;
+  int rc = posix_memalign(&source, alignof(int64_t), bytes);
+  if (rc != 0 || !source) {
+    throw std::runtime_error("posix_memalign(CXI atomic source buffer) failed");
+  }
+  rc = posix_memalign(&result, alignof(int64_t), bytes);
+  if (rc != 0 || !result) {
+    std::free(source);
+    throw std::runtime_error("posix_memalign(CXI atomic result buffer) failed");
+  }
+  std::memset(source, 0, bytes);
+  std::memset(result, 0, bytes);
+
+  check_fi("fi_mr_reg(atomic source)",
+           fi_mr_reg(domain_, source, bytes, FI_SEND | FI_RECV | FI_READ |
+                                               FI_WRITE,
+                     0, 0, 0, &atomic_source_mr_, nullptr));
+
+  check_fi("fi_mr_reg(atomic result)",
+           fi_mr_reg(domain_, result, bytes, FI_SEND | FI_RECV | FI_READ |
+                                             FI_WRITE,
+                     0, 0, 0, &atomic_result_mr_, nullptr));
+  if (info_->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+    check_fi("fi_mr_bind(atomic source ep)",
+             fi_mr_bind(atomic_source_mr_, &ep_->fid, 0));
+    check_fi("fi_mr_enable(atomic source)", fi_mr_enable(atomic_source_mr_));
+    check_fi("fi_mr_bind(atomic result ep)",
+             fi_mr_bind(atomic_result_mr_, &ep_->fid, 0));
+    check_fi("fi_mr_enable(atomic result)", fi_mr_enable(atomic_result_mr_));
+  }
+
+  atomic_source_ptr_ = static_cast<int64_t*>(source);
+  atomic_result_ptr_ = static_cast<int64_t*>(result);
+  atomic_buffer_count_ = count;
+}
+
+void Transport::fetch_atomic_add64(fi_addr_t peer, int64_t value,
+                                   uint64_t remote_offset,
+                                   uint64_t remote_key, size_t result_index,
+                                   WriteContext* ctx) {
+  if (!ep_) throw std::runtime_error("CXI endpoint missing");
+  if (!ctx) throw std::runtime_error("CXI atomic context is null");
+  ensure_atomic_buffers(result_index + 1);
+  atomic_source_ptr_[result_index] = value;
+
+  fi_ioc local{};
+  local.addr = atomic_source_ptr_ + result_index;
+  local.count = 1;
+  void* local_desc = fi_mr_desc(atomic_source_mr_);
+
+  fi_rma_ioc remote{};
+  remote.addr = remote_offset;
+  remote.count = 1;
+  remote.key = remote_key;
+
+  fi_msg_atomic msg{};
+  msg.msg_iov = &local;
+  msg.desc = &local_desc;
+  msg.iov_count = 1;
+  msg.addr = peer;
+  msg.rma_iov = &remote;
+  msg.rma_iov_count = 1;
+  msg.datatype = FI_INT64;
+  msg.op = FI_SUM;
+  msg.context = &ctx->ctx;
+
+  fi_ioc result{};
+  result.addr = atomic_result_ptr_ + result_index;
+  result.count = 1;
+  void* result_desc = fi_mr_desc(atomic_result_mr_);
+
+  check_fi("fi_fetch_atomicmsg(add64)",
+           fi_fetch_atomicmsg(ep_, &msg, &result, &result_desc, 1,
+                              FI_COMPLETION));
 }
 
 void Transport::inject_atomic_add64(fi_addr_t peer, int64_t value,

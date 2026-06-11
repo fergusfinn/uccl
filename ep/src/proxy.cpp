@@ -7,7 +7,10 @@
 #include <arpa/inet.h>  // for htonl, ntohl
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <thread>
 #include <errno.h>
 #include <fcntl.h>
@@ -119,9 +122,37 @@ static std::atomic<int64_t>* cxi_barrier_slots(void* atomic_buffer_ptr) {
 }
 #endif
 
+namespace {
+
+bool env_flag_enabled(char const* name) {
+  char const* value = std::getenv(name);
+  if (!value || value[0] == '\0') return false;
+  return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+         std::strcmp(value, "False") != 0 &&
+         std::strcmp(value, "FALSE") != 0 &&
+         std::strcmp(value, "off") != 0 && std::strcmp(value, "Off") != 0 &&
+         std::strcmp(value, "OFF") != 0 &&
+         std::strcmp(value, "none") != 0 && std::strcmp(value, "None") != 0 &&
+         std::strcmp(value, "NONE") != 0;
+}
+
+std::string const& metrics_hostname() {
+  static std::string const hostname = [] {
+    char buf[256] = {};
+    if (gethostname(buf, sizeof(buf) - 1) == 0 && buf[0] != '\0') {
+      return std::string(buf);
+    }
+    return std::string("unknown");
+  }();
+  return hostname;
+}
+
+}  // namespace
+
 Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
   // Initialize state tracking for each ring buffer
   listen_port_ = uccl::create_listen_socket(&listen_fd_);
+  metrics_enabled_ = env_flag_enabled("UCCL_METRICS");
 #ifndef USE_MSCCLPP_FIFO_BACKEND
   ring_tails_.resize(cfg_.d2h_queues.size(), 0);
   ring_seen_.resize(cfg_.d2h_queues.size(), 0);
@@ -140,6 +171,148 @@ double Proxy::avg_wr_latency_us() const {
 }
 
 uint64_t Proxy::completed_wr() const { return completion_count_; }
+
+ProxyMetrics* Proxy::metrics_ptr() {
+  return metrics_enabled_ ? &metrics_ : nullptr;
+}
+
+int Proxy::metrics_interval_ms() const {
+  char const* value = std::getenv("UCCL_METRICS_INTERVAL_MS");
+  if (!value || value[0] == '\0') return 1000;
+
+  char* end = nullptr;
+  errno = 0;
+  long parsed = std::strtol(value, &end, 10);
+  if (errno != 0 || end == value || parsed <= 0) return 1000;
+  if (parsed < 100) return 100;
+  if (parsed > 60000) return 60000;
+  return static_cast<int>(parsed);
+}
+
+ProxyMetricsSnapshot Proxy::metrics_snapshot() const {
+  ProxyMetricsSnapshot s;
+  s.cxi_completed_bytes =
+      metrics_.cxi_completed_bytes.load(std::memory_order_relaxed);
+  s.cxi_completed_writes =
+      metrics_.cxi_completed_writes.load(std::memory_order_relaxed);
+  s.cxi_completed_batches =
+      metrics_.cxi_completed_batches.load(std::memory_order_relaxed);
+  s.cxi_active_ns = metrics_.cxi_active_ns.load(std::memory_order_relaxed);
+  return s;
+}
+
+void Proxy::emit_metrics_delta(ProxyMetricsSnapshot const& previous,
+                               std::chrono::steady_clock::time_point previous_time,
+                               bool final) {
+  auto const now = std::chrono::steady_clock::now();
+  auto const current = metrics_snapshot();
+
+  uint64_t const bytes =
+      current.cxi_completed_bytes - previous.cxi_completed_bytes;
+  uint64_t const writes =
+      current.cxi_completed_writes - previous.cxi_completed_writes;
+  uint64_t const batches =
+      current.cxi_completed_batches - previous.cxi_completed_batches;
+  uint64_t const active_ns = current.cxi_active_ns - previous.cxi_active_ns;
+  if (bytes == 0 && writes == 0 && batches == 0) {
+    return;
+  }
+
+  double const window_ms =
+      std::chrono::duration<double, std::milli>(now - previous_time).count();
+  double const seconds = window_ms / 1000.0;
+  double const gb_per_s =
+      seconds > 0.0 ? static_cast<double>(bytes) / 1.0e9 / seconds : 0.0;
+  double const active_ms = static_cast<double>(active_ns) / 1.0e6;
+  double const active_seconds = static_cast<double>(active_ns) / 1.0e9;
+  double const active_gb_per_s =
+      active_seconds > 0.0
+          ? static_cast<double>(bytes) / 1.0e9 / active_seconds
+          : 0.0;
+  double const avg_write_bytes =
+      writes > 0 ? static_cast<double>(bytes) / static_cast<double>(writes)
+                 : 0.0;
+  auto const wall_now = std::chrono::system_clock::now();
+  auto const unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           wall_now.time_since_epoch())
+                           .count();
+  char line[1024];
+  int len = std::snprintf(
+      line, sizeof(line),
+      "[UCCL_METRICS] schema=3 time_unix_ms=%lld pid=%ld host=%s "
+      "rank=%d local_rank=%d node_idx=%d proxy=%d scope=proxy mode=%s "
+      "final=%d window_ms=%.3f cxi_active_ms=%.3f cxi_bytes=%llu "
+      "cxi_gb_per_s=%.6f cxi_active_gb_per_s=%.6f cxi_writes=%llu "
+      "cxi_batches=%llu avg_write_bytes=%.1f\n",
+      static_cast<long long>(unix_ms), static_cast<long>(getpid()),
+      metrics_hostname().c_str(), cfg_.rank, cfg_.local_rank, cfg_.node_idx,
+      cfg_.thread_idx,
+      cfg_.use_normal_mode ? "high_throughput" : "low_latency", final ? 1 : 0,
+      window_ms, active_ms, static_cast<unsigned long long>(bytes), gb_per_s,
+      active_gb_per_s, static_cast<unsigned long long>(writes),
+      static_cast<unsigned long long>(batches), avg_write_bytes);
+  if (len <= 0) return;
+
+  size_t remaining =
+      std::min(static_cast<size_t>(len), sizeof(line) - static_cast<size_t>(1));
+  if (remaining == sizeof(line) - static_cast<size_t>(1)) {
+    line[remaining - 1] = '\n';
+  }
+
+  char const* p = line;
+  while (remaining > 0) {
+    ssize_t written = write(STDERR_FILENO, p, remaining);
+    if (written < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    p += written;
+    remaining -= static_cast<size_t>(written);
+  }
+}
+
+void Proxy::start_metrics_emitter() {
+  if (!metrics_enabled_) return;
+  bool expected = false;
+  if (!metrics_run_.compare_exchange_strong(expected, true,
+                                            std::memory_order_acq_rel)) {
+    return;
+  }
+  metrics_thread_ = std::thread([this]() { metrics_loop(); });
+}
+
+void Proxy::stop_metrics_emitter() {
+  if (!metrics_enabled_) return;
+  bool expected = true;
+  if (!metrics_run_.compare_exchange_strong(expected, false,
+                                            std::memory_order_acq_rel)) {
+    return;
+  }
+  metrics_cv_.notify_all();
+  if (metrics_thread_.joinable()) metrics_thread_.join();
+}
+
+void Proxy::metrics_loop() {
+  int const interval_ms = metrics_interval_ms();
+  auto previous = metrics_snapshot();
+  auto previous_time = std::chrono::steady_clock::now();
+
+  std::unique_lock<std::mutex> lock(metrics_mu_);
+  while (metrics_run_.load(std::memory_order_acquire)) {
+    bool const stopping = metrics_cv_.wait_for(
+        lock, std::chrono::milliseconds(interval_ms),
+        [this]() { return !metrics_run_.load(std::memory_order_acquire); });
+    lock.unlock();
+    if (!stopping) {
+      emit_metrics_delta(previous, previous_time, false);
+      previous = metrics_snapshot();
+      previous_time = std::chrono::steady_clock::now();
+    }
+    lock.lock();
+  }
+  lock.unlock();
+  emit_metrics_delta(previous, previous_time, true);
+}
 
 void Proxy::pin_thread_to_cpu_wrapper() {
   if (cfg_.pin_thread) {
@@ -623,6 +796,7 @@ void Proxy::init_remote() {
 void Proxy::run_sender() {
   printf("CPU sender thread %d started\n", cfg_.thread_idx);
   init_sender();
+  start_metrics_emitter();
   size_t seen = 0;
   uint64_t my_tail = 0;
   while (ctx_.progress_run.load(std::memory_order_acquire)) {
@@ -630,6 +804,7 @@ void Proxy::run_sender() {
     notify_gpu_completion(my_tail);
     post_gpu_command(my_tail, seen);
   }
+  stop_metrics_emitter();
 }
 
 void Proxy::run_remote() {
@@ -680,6 +855,7 @@ void Proxy::run_dual() {
   size_t seen = 0;
   std::set<PendingUpdate> pending_atomic_updates;
   adaptive_sleeper_.update_timer();
+  start_metrics_emitter();
   while (ctx_.progress_run.load(std::memory_order_acquire)) {
     adaptive_sleeper_.maybe_sleep(ctx_);
 
@@ -712,6 +888,7 @@ void Proxy::run_dual() {
       barrier_check();
     }
   }
+  stop_metrics_emitter();
 }
 
 void Proxy::notify_gpu_completion(uint64_t& my_tail) {
@@ -1135,7 +1312,8 @@ void Proxy::post_gpu_commands_mixed(
   if (!rdma_wrs.empty()) {
     post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
                             rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
-                            cfg_.thread_idx, cfg_.use_normal_mode);
+                            cfg_.thread_idx, cfg_.use_normal_mode,
+                            metrics_ptr());
 #ifdef USE_CXI
     for (uint64_t wr_id : rdma_wrs) acked_wrs_.insert(wr_id);
 #endif
@@ -1221,6 +1399,8 @@ void Proxy::quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds) {
 }
 
 void Proxy::destroy(bool free_gpu_buffer) {
+  stop_metrics_emitter();
+
   for (auto& ctx_ptr : ctxs_for_all_ranks_) {
     if (!ctx_ptr) continue;
     if (ctx_ptr->qps_are_shared) continue;  // owned by ctx_ (EFA)
